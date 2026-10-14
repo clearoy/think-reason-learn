@@ -109,6 +109,17 @@ class FakePolicyLLM:
         digest = hashlib.md5(f"{policy_text}||{sample_str}".encode()).digest()
         return "YES" if digest[0] % 2 == 0 else "NO"
 
+    @classmethod
+    def decision_probability(cls, policy_text: str, sample_str: str) -> float:
+        """P(YES) consistent with ``verdict`` (>= 0.5 iff YES), but not binary."""
+        digest = hashlib.md5(f"{policy_text}##{sample_str}".encode()).digest()
+        offset = 0.05 + 0.4 * digest[0] / 255
+        return (
+            0.5 + offset
+            if cls.verdict(policy_text, sample_str) == "YES"
+            else 0.5 - offset
+        )
+
     def policy_texts(self) -> List[str]:
         return [
             f"Policy {i}: the founder shows trait {i}." for i in range(self.n_policies)
@@ -154,7 +165,7 @@ class FakePolicyLLM:
         state: str,
         questions: List[Any],
     ) -> DecisionResponse:
-        """Answer each policy question with 0.9 (YES) or 0.1 (NO)."""
+        """Answer each policy question with a non-binary P(YES)."""
         self._call_count += 1
         self.calls.append({"response_format": "decide", "n": self._call_count})
         self.decide_calls.append({"state": state, "questions": questions})
@@ -163,9 +174,9 @@ class FakePolicyLLM:
         answers = {}
         for q in questions:
             policy_text = q.instructions.split("Policy: ", 1)[1].strip()
-            yes = self.verdict(policy_text, sample_str) == "YES"
             answers[q.name] = PredicateAnswer(
-                name=q.name, probability=0.9 if yes else 0.1
+                name=q.name,
+                probability=self.decision_probability(policy_text, sample_str),
             )
         return DecisionResponse(
             answers=answers,

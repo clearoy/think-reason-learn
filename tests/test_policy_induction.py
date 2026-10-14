@@ -480,8 +480,8 @@ def test_predict_llmc_rejects_mixing_decision_and_chat():
 
 
 @pytest.mark.asyncio
-async def test_jev_scoring_matches_chat_scoring(tmp_path):
-    """Scoring via decide() yields the same YES/NO cells as the chat path."""
+async def test_jev_scores_are_probabilities_agreeing_with_chat(tmp_path):
+    """Jev cells hold P(YES); thresholding at 0.5 recovers the chat YES/NO."""
     fake_chat = FakePolicyLLM(n_policies=6)
     chat = make_pi(tmp_path / "chat", fake_chat)
     seed_for_scoring(chat, fake_chat)
@@ -498,10 +498,42 @@ async def test_jev_scoring_matches_chat_scoring(tmp_path):
 
     assert fake_jev.decide_calls and fake_jev.batch_calls == 0
     assert fake_chat.decide_calls == []
-    pd.testing.assert_frame_equal(
-        chat._policy_memory.drop(columns=["policy"], errors="ignore"),
-        jev._policy_memory.drop(columns=["policy"], errors="ignore"),
+    for pid in chat._policy_memory.index:
+        probs = jev._policy_memory.at[pid, "predictions"].astype(float)
+        verdicts = chat._policy_memory.at[pid, "predictions"]
+        assert ((probs >= 0.5).map({True: "YES", False: "NO"}) == verdicts).all()
+        assert not probs.isin([0.0, 1.0]).any()
+
+
+@pytest.mark.asyncio
+async def test_jev_feature_matrix_keeps_probabilities(tmp_path):
+    fake = FakePolicyLLM(n_policies=6)
+    pi = make_pi(
+        tmp_path, fake, predict_llmc=[{"provider": "typesafe", "model": "jev-latest"}]
     )
+    seed_for_scoring(pi, fake)
+    await pi._score_policies()
+    feats = pi._build_feature_matrix()[0]
+    assert ((feats > 0) & (feats < 1)).all()
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("YES", 1.0),
+        ("NO", 0.0),
+        (0.83, 0.83),
+        ("0.83", 0.83),
+        (None, 0.0),
+        (float("nan"), 0.0),
+        (1.7, 1.0),
+        ("garbage", 0.0),
+    ],
+)
+def test_score_value(value, expected):
+    from think_reason_learn.policy_induction._policy_induction import _score_value
+
+    assert _score_value(value) == pytest.approx(expected)
 
 
 def test_jev_predict_llmc_round_trips(tmp_path):

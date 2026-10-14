@@ -68,8 +68,26 @@ DEFAULT_PREDICT_LLMC: List[LLMChoice | DecisionChoice] = [
 ]
 """Default scorer: TypeSafe's Jev decision model (needs ``TYPESAFE_API_KEY``)."""
 
-# A predicate probability at or above this counts as YES.
-_DECISION_YES_THRESHOLD = 0.5
+# One judged (policy, sample) cell: "YES"/"NO" from a chat LLM, or P(YES) from a
+# decision model.
+PolicyScore = Union[Literal["YES", "NO"], float]
+
+
+def _score_value(v: Any) -> float:
+    """Numeric feature for a stored cell: P(YES) as-is, YES/NO as 1.0/0.0.
+
+    Also parses probabilities that were round-tripped through parquet as
+    strings. Anything unparseable (including missing) is 0.0.
+    """
+    text = str(v).strip().lower()
+    if text in {"1", "true", "yes", "y", "t"}:
+        return 1.0
+    try:
+        x = float(text)
+    except ValueError:
+        return 0.0
+    return min(max(x, 0.0), 1.0) if x == x else 0.0
+
 
 # Compact terminal-style progress bar: "[TAG] ████░░░░ n/total · rate/s · eta MM:SS"
 _BAR_FORMAT = "{desc} {bar} {n_fmt}/{total_fmt} · {rate_fmt} · eta {remaining}"
@@ -143,11 +161,12 @@ class PolicyInduction:
         predict_llmc: Models that judge each (policy, sample) pair, in priority
             order. Defaults to TypeSafe's Jev (``jev-latest``, needs
             ``TYPESAFE_API_KEY``), a decision model that answers every policy
-            as a yes/no question in one call; a probability >= 0.5 counts as
-            YES. Pass ordinary ``LLMChoice`` entries to score with a chat LLM
-            instead (e.g. ``predict_llmc=gen_llmc``). Entries must be all
-            decision models or all chat LLMs; ``predict_temperature`` only
-            applies to chat LLMs.
+            as a yes/no question in one call, and its probability of YES is used
+            directly as the policy's feature (instead of a 0/1 answer). Pass
+            ordinary ``LLMChoice`` entries to score with a chat LLM instead
+            (e.g. ``predict_llmc=gen_llmc``). Entries must be all decision
+            models or all chat LLMs; ``predict_temperature`` only applies to
+            chat LLMs.
         config: Weight training configuration.
         gen_temperature: Sampling temperature for generation.
         predict_temperature: Sampling temperature for prediction.
@@ -837,12 +856,13 @@ class PolicyInduction:
         policies: Sequence[Tuple[str, str]],
         token_counter: TokenCounter,
         caller: str,
-    ) -> Dict[str, Literal["YES", "NO"]]:
+    ) -> Dict[str, PolicyScore]:
         """Judge one sample against several policies with a decision model.
 
         Each policy becomes one yes/no question about the same state, answered
-        in a single call. Failures and refusals leave keys out of the result,
-        so the caller retries them on resume, like the chat-LLM path.
+        in a single call. Returns each policy's probability of YES. Failures
+        and refusals leave keys out of the result, so the caller retries them
+        on resume, like the chat-LLM path.
         """
         state = f"Task description:\n{self._task_description}\n\nSample:\n{sample_str}"
         questions = [
@@ -870,11 +890,11 @@ class PolicyInduction:
             logger.warning("Decision scoring worker error", exc_info=True)
             return {}
 
-        out: Dict[str, Literal["YES", "NO"]] = {}
+        out: Dict[str, PolicyScore] = {}
         for i, (key, _) in enumerate(policies):
             prob = response.probability(f"p{i}")
             if prob is not None:
-                out[key] = "YES" if prob >= _DECISION_YES_THRESHOLD else "NO"
+                out[key] = prob
         return out
 
     async def _score_policy_batch(
@@ -883,7 +903,7 @@ class PolicyInduction:
         policies: Sequence[Tuple[str, str]],
         token_counter: TokenCounter,
         caller: str,
-    ) -> Dict[str, Literal["YES", "NO"]]:
+    ) -> Dict[str, PolicyScore]:
         """Judge one sample against several policies in a single LLM call.
 
         Shared by fit-time scoring and predict(), so both paths always draw
@@ -898,9 +918,10 @@ class PolicyInduction:
             caller: Label recorded on the token counter.
 
         Returns:
-            key -> "YES"/"NO" for every policy successfully judged. Keys absent
-            from the mapping could not be resolved even after an individual
-            re-query; the caller decides what that means.
+            key -> "YES"/"NO" (chat LLM) or P(YES) (decision model) for every
+            policy successfully judged. Keys absent from the mapping could not
+            be resolved even after an individual re-query; the caller decides
+            what that means.
         """
         if not policies:
             return {}
@@ -923,7 +944,7 @@ class PolicyInduction:
             f"Sample:\n{sample_str}\n\n"
         )
 
-        out: Dict[str, Literal["YES", "NO"]] = {}
+        out: Dict[str, PolicyScore] = {}
         try:
             async with self._llm_semaphore:
                 response = await self._llm_instance.respond(
@@ -1126,11 +1147,14 @@ class PolicyInduction:
         def to_binary(v: Any) -> int:
             return 1 if str(v).strip().lower() in {"1", "true", "yes", "y", "t"} else 0
 
+        # Policy columns keep P(YES) when a decision model scored them; labels
+        # are always 0/1.
+
         for idx, row in pm.iterrows():
             col = str(idx)
             col_data[col] = (
                 row["predictions"]
-                .map(to_binary)  # type: ignore
+                .map(_score_value)  # type: ignore
                 .reindex(sample_index)
                 .fillna(0)
                 .astype(np.float32)
@@ -1282,7 +1306,7 @@ class PolicyInduction:
                     if ans is None:
                         missing_positions.append(pos)
                     else:
-                        results[pos] = 1.0 if ans == "YES" else 0.0
+                        results[pos] = _score_value(ans)
             except Exception:
                 logger.warning("Predict worker error", exc_info=True)
                 missing_positions.extend(pos for pos, _ in chunk)
