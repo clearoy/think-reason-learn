@@ -26,18 +26,23 @@ from ._openai.schemas import (
 )
 from ._google.schemas import GoogleChatModel, GoogleChoice, GoogleChoiceDict
 from ._xai.schemas import xAIChatModel, XAIChoice, XAIChoiceDict
-from ._typesafe.schemas import TypeSafeDecisionChoice, TypeSafeDecisionChoiceDict
+from ._typesafe.schemas import (
+    TypeSafeDecisionChoice,
+    TypeSafeDecisionChoiceDict,
+    TypeSafeDecisionModel,
+)
 
 
 T = TypeVar("T", bound=BaseModel | str, covariant=True)
 
 
-LLMProvider: TypeAlias = Literal["anthropic", "google", "openai", "xai"]
+LLMProvider: TypeAlias = Literal["anthropic", "google", "openai", "xai", "typesafe"]
 LLMChatModel: TypeAlias = Union[
     AnthropicChatModel,
     GoogleChatModel,
     OpenAIChatModel,
     xAIChatModel,
+    TypeSafeDecisionModel,
 ]
 LLMChoiceModel: TypeAlias = Union[
     AnthropicChoice,

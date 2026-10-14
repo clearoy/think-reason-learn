@@ -6,7 +6,12 @@ import hashlib
 import re
 from typing import Any, Dict, List, Literal, Set, Type
 
-from think_reason_learn.core.llms import OpenAIChoice
+from think_reason_learn.core.llms import (
+    DecisionResponse,
+    OpenAIChoice,
+    PredicateAnswer,
+    TypeSafeDecisionChoice,
+)
 from think_reason_learn.core.llms._schemas import (
     NOT_GIVEN,
     LLMChoice,
@@ -72,6 +77,7 @@ class FakePolicyLLM:
         self.fail_single = fail_single
         self._call_count = 0
         self.calls: List[Dict[str, Any]] = []
+        self.decide_calls: List[Dict[str, Any]] = []
 
     # ── Call accounting ────────────────────────────────────────────────────────
 
@@ -140,6 +146,31 @@ class FakePolicyLLM:
         raise TypeError(
             f"FakePolicyLLM: unknown response_format {response_format!r}. "
             "Add a handler for this new call site."
+        )
+
+    async def decide(
+        self,
+        decision_priority: List[Any],
+        state: str,
+        questions: List[Any],
+    ) -> DecisionResponse:
+        """Answer each policy question with 0.9 (YES) or 0.1 (NO)."""
+        self._call_count += 1
+        self.calls.append({"response_format": "decide", "n": self._call_count})
+        self.decide_calls.append({"state": state, "questions": questions})
+
+        sample_str = state.split("Sample:\n", 1)[1].strip()
+        answers = {}
+        for q in questions:
+            policy_text = q.instructions.split("Policy: ", 1)[1].strip()
+            yes = self.verdict(policy_text, sample_str) == "YES"
+            answers[q.name] = PredicateAnswer(
+                name=q.name, probability=0.9 if yes else 0.1
+            )
+        return DecisionResponse(
+            answers=answers,
+            total_tokens=10,
+            provider_model=TypeSafeDecisionChoice(model="jev-latest"),
         )
 
     # ── Canned responses ───────────────────────────────────────────────────────

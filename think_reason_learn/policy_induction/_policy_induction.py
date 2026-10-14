@@ -47,7 +47,13 @@ from sklearn.model_selection import StratifiedKFold
 from tqdm.auto import tqdm
 
 from think_reason_learn.core.exceptions import DataError, LLMError
-from think_reason_learn.core.llms import LLMChoice, TokenCounter, llm
+from think_reason_learn.core.llms import (
+    DecisionChoice,
+    LLMChoice,
+    PredicateQuestion,
+    TokenCounter,
+    llm,
+)
 from ._prompts import (
     POLICY_GEN_INSTRUCTIONS,
     POLICY_PREDICT_BATCH_INSTRUCTIONS,
@@ -56,6 +62,14 @@ from ._prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PREDICT_LLMC: List[LLMChoice | DecisionChoice] = [
+    {"provider": "typesafe", "model": "jev-latest"}
+]
+"""Default scorer: TypeSafe's Jev decision model (needs ``TYPESAFE_API_KEY``)."""
+
+# A predicate probability at or above this counts as YES.
+_DECISION_YES_THRESHOLD = 0.5
 
 # Compact terminal-style progress bar: "[TAG] ████░░░░ n/total · rate/s · eta MM:SS"
 _BAR_FORMAT = "{desc} {bar} {n_fmt}/{total_fmt} · {rate_fmt} · eta {remaining}"
@@ -126,7 +140,14 @@ class PolicyInduction:
 
     Args:
         gen_llmc: LLMs for policy generation, in priority order.
-        predict_llmc: LLMs for prediction. Defaults to gen_llmc.
+        predict_llmc: Models that judge each (policy, sample) pair, in priority
+            order. Defaults to TypeSafe's Jev (``jev-latest``, needs
+            ``TYPESAFE_API_KEY``), a decision model that answers every policy
+            as a yes/no question in one call; a probability >= 0.5 counts as
+            YES. Pass ordinary ``LLMChoice`` entries to score with a chat LLM
+            instead (e.g. ``predict_llmc=gen_llmc``). Entries must be all
+            decision models or all chat LLMs; ``predict_temperature`` only
+            applies to chat LLMs.
         config: Weight training configuration.
         gen_temperature: Sampling temperature for generation.
         predict_temperature: Sampling temperature for prediction.
@@ -160,7 +181,7 @@ class PolicyInduction:
     def __init__(
         self,
         gen_llmc: List[LLMChoice],
-        predict_llmc: List[LLMChoice] | None = None,
+        predict_llmc: List[LLMChoice | DecisionChoice] | None = None,
         config: WeightTrainerConfig | dict | None = None,
         gen_temperature: float = 1.0,
         predict_temperature: float = 0.0,
@@ -190,7 +211,8 @@ class PolicyInduction:
             predict_temperature=predict_temperature,
         )
         self.gen_llmc = gen_llmc
-        self.predict_llmc = predict_llmc or gen_llmc
+        self.predict_llmc = predict_llmc or list(DEFAULT_PREDICT_LLMC)
+        self._validate_predict_llmc(self.predict_llmc)
         self.gen_temperature = gen_temperature
         self.predict_temperature = predict_temperature
         self._llm_semaphore_limit = llm_semaphore_limit
@@ -298,6 +320,24 @@ class PolicyInduction:
             raise ValueError("gen_temperature must be in [0, 2]")
         if not (0 <= kw["predict_temperature"] <= 2):
             raise ValueError("predict_temperature must be in [0, 2]")
+
+    @staticmethod
+    def _is_decision_llmc(llmc: LLMChoice | DecisionChoice) -> bool:
+        provider = llmc["provider"] if isinstance(llmc, dict) else llmc.provider
+        return provider == "typesafe"
+
+    @property
+    def _decision_scoring(self) -> bool:
+        """Whether scoring uses a decision model rather than a chat LLM."""
+        return self._is_decision_llmc(self.predict_llmc[0])
+
+    def _validate_predict_llmc(
+        self, predict_llmc: List[LLMChoice | DecisionChoice]
+    ) -> None:
+        if len({self._is_decision_llmc(lc) for lc in predict_llmc}) > 1:
+            raise ValueError(
+                "predict_llmc can't mix decision models (typesafe) with chat LLMs."
+            )
 
     def _parse_name(self, name: str | None) -> str:
         if name is None:
@@ -459,7 +499,7 @@ class PolicyInduction:
     # ── Request confirmation ────────────────────────────────────────────────────
 
     @staticmethod
-    def _llmc_label(llmc: LLMChoice) -> str:
+    def _llmc_label(llmc: LLMChoice | DecisionChoice) -> str:
         return llmc["model"] if isinstance(llmc, dict) else llmc.model
 
     def _confirm_requests(self, estimates: Dict[str, int]) -> None:
@@ -791,6 +831,52 @@ class PolicyInduction:
             logger.warning("Scoring worker error", exc_info=True)
             return None
 
+    async def _decide_batch(
+        self,
+        sample_str: str,
+        policies: Sequence[Tuple[str, str]],
+        token_counter: TokenCounter,
+        caller: str,
+    ) -> Dict[str, Literal["YES", "NO"]]:
+        """Judge one sample against several policies with a decision model.
+
+        Each policy becomes one yes/no question about the same state, answered
+        in a single call. Failures and refusals leave keys out of the result,
+        so the caller retries them on resume, like the chat-LLM path.
+        """
+        state = f"Task description:\n{self._task_description}\n\nSample:\n{sample_str}"
+        questions = [
+            PredicateQuestion(
+                name=f"p{i}",
+                instructions="Does the sample satisfy this policy, given the task "
+                f"description?\nPolicy: {text}",
+            )
+            for i, (_, text) in enumerate(policies)
+        ]
+        try:
+            async with self._llm_semaphore:
+                response = await self._llm_instance.decide(
+                    decision_priority=self.predict_llmc,
+                    state=state,
+                    questions=questions,
+                )
+            await token_counter.append(
+                provider=response.provider_model.provider,
+                model=response.provider_model.model,
+                value=response.total_tokens,
+                caller=caller,
+            )
+        except Exception:
+            logger.warning("Decision scoring worker error", exc_info=True)
+            return {}
+
+        out: Dict[str, Literal["YES", "NO"]] = {}
+        for i, (key, _) in enumerate(policies):
+            prob = response.probability(f"p{i}")
+            if prob is not None:
+                out[key] = "YES" if prob >= _DECISION_YES_THRESHOLD else "NO"
+        return out
+
     async def _score_policy_batch(
         self,
         sample_str: str,
@@ -818,6 +904,8 @@ class PolicyInduction:
         """
         if not policies:
             return {}
+        if self._decision_scoring:
+            return await self._decide_batch(sample_str, policies, token_counter, caller)
         if len(policies) == 1:
             key, text = policies[0]
             ans = await self._score_policy_single(

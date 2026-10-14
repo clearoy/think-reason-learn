@@ -38,6 +38,8 @@ def make_pi(tmp_path, fake: FakePolicyLLM, **kw) -> PolicyInduction:
     """A PolicyInduction wired to the fake, with a task already set."""
     kw.setdefault("policy_batch_size", 3)
     kw.setdefault("llm_semaphore_limit", 3)
+    # The default scorer is Jev; most tests exercise the chat-LLM path.
+    kw.setdefault("predict_llmc", [OpenAIChoice(model="gpt-4.1-nano")])
     pi = PolicyInduction(
         gen_llmc=[OpenAIChoice(model="gpt-4.1-nano")],
         confirm_requests=False,
@@ -453,3 +455,61 @@ async def test_predict_warns_on_partial_miss(tmp_path, caplog):
 
     assert len(records) == len(X)
     assert any("answers missing after re-query" in m for m in caplog.messages)
+
+
+# ── Decision-model (Jev) scoring ───────────────────────────────────────────────
+
+
+def test_default_predict_llmc_is_jev():
+    pi = PolicyInduction(
+        gen_llmc=[OpenAIChoice(model="gpt-4.1-nano")], confirm_requests=False
+    )
+    assert pi.predict_llmc == [{"provider": "typesafe", "model": "jev-latest"}]
+    assert pi._decision_scoring
+
+
+def test_predict_llmc_rejects_mixing_decision_and_chat():
+    with pytest.raises(ValueError, match="mix"):
+        PolicyInduction(
+            gen_llmc=[OpenAIChoice(model="gpt-4.1-nano")],
+            predict_llmc=[
+                {"provider": "typesafe", "model": "jev-latest"},
+                OpenAIChoice(model="gpt-4.1-nano"),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_jev_scoring_matches_chat_scoring(tmp_path):
+    """Scoring via decide() yields the same YES/NO cells as the chat path."""
+    fake_chat = FakePolicyLLM(n_policies=6)
+    chat = make_pi(tmp_path / "chat", fake_chat)
+    seed_for_scoring(chat, fake_chat)
+    await chat._score_policies()
+
+    fake_jev = FakePolicyLLM(n_policies=6)
+    jev = make_pi(
+        tmp_path / "jev",
+        fake_jev,
+        predict_llmc=[{"provider": "typesafe", "model": "jev-latest"}],
+    )
+    seed_for_scoring(jev, fake_jev)
+    await jev._score_policies()
+
+    assert fake_jev.decide_calls and fake_jev.batch_calls == 0
+    assert fake_chat.decide_calls == []
+    pd.testing.assert_frame_equal(
+        chat._policy_memory.drop(columns=["policy"], errors="ignore"),
+        jev._policy_memory.drop(columns=["policy"], errors="ignore"),
+    )
+
+
+def test_jev_predict_llmc_round_trips(tmp_path):
+    fake = FakePolicyLLM(n_policies=6)
+    pi = make_pi(
+        tmp_path, fake, predict_llmc=[{"provider": "typesafe", "model": "jev-latest"}]
+    )
+    pi.save(tmp_path / "model")
+    loaded = PolicyInduction.load(tmp_path / "model")
+    assert loaded.predict_llmc == pi.predict_llmc
+    assert loaded._decision_scoring
