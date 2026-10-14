@@ -14,7 +14,21 @@ from ._google.ask import GeminiLLM, get_google_llm
 from ._google.schemas import GoogleChoice
 from ._openai.ask import OpenAILLM, get_openai_llm
 from ._openai.schemas import OpenAIChoice
-from ._schemas import NOT_GIVEN, LLMChoice, LLMChoiceModel, LLMResponse, NotGiven, T
+from ._schemas import (
+    NOT_GIVEN,
+    DecisionChoice,
+    DecisionChoiceModel,
+    DecisionQuestion,
+    DecisionResponse,
+    LLMChoice,
+    LLMChoiceModel,
+    LLMResponse,
+    NotGiven,
+    OpenAIDecisionChoice,
+    T,
+    TypeSafeDecisionChoice,
+)
+from ._typesafe.ask import TypeSafeLLM, get_typesafe_llm
 from ._xai.ask import get_xai_llm, xAILLM
 from ._xai.schemas import XAIChoice
 
@@ -29,6 +43,34 @@ class LLM(metaclass=SingletonMeta):
         self.google_llm = get_google_llm(settings.GOOGLE_AI_API_KEY)
         self.openai_llm = get_openai_llm(settings.OPENAI_API_KEY)
         self.xai_llm = get_xai_llm(settings.XAI_API_KEY)
+        self.typesafe_llm = get_typesafe_llm(settings.TYPESAFE_API_KEY)
+
+    def _val_decision_priority_and_api_keys(
+        self, decision_priority: List[DecisionChoice]
+    ) -> List[DecisionChoiceModel]:
+        """Validate the decision priority and ensure the API key is set."""
+        models_map = {
+            "openai": OpenAIDecisionChoice,
+            "typesafe": TypeSafeDecisionChoice,
+        }
+        priority_models: List[DecisionChoiceModel] = []
+        for dp in decision_priority:
+            if isinstance(dp, dict):
+                priority_class = models_map.get(dp["provider"])
+                if priority_class is None:
+                    raise ValueError(
+                        f"Invalid decision priority: {dp['provider']}. "
+                        f"Supported providers are {list(models_map.keys())}."
+                    )
+                dp = priority_class(**dp)  # type: ignore
+
+            if getattr(self, f"{dp.provider}_llm") is None:
+                raise ValueError(
+                    f"Can't use {dp.model}. {dp.provider.upper()}_API_KEY not set! "
+                    "Explicitly set it in your environment."
+                )
+            priority_models.append(dp)
+        return priority_models
 
     def _val_llm_priority_and_api_keys(
         self, llm_priority: List[LLMChoice]
@@ -297,3 +339,85 @@ class LLM(metaclass=SingletonMeta):
 
         llmps = [f"{llmp.provider}: {llmp.model}" for llmp in llm_priority_models]
         raise ValueError(f"Failed to respond with any of {llmps}")
+
+    def decide_sync(
+        self,
+        decision_priority: List[DecisionChoice],
+        state: str,
+        questions: List[DecisionQuestion],
+    ) -> DecisionResponse:
+        """Ask a decision model typed questions about a state synchronously.
+
+        Args:
+            decision_priority: Decision models to use in order of priority.
+            state: The shared evidence (text) the questions are asked about.
+            questions: Predicate, choice and score questions with unique names.
+
+        Returns:
+            The answers keyed by question name.
+
+        Raises:
+            AssertionError: If decision_priority or questions is empty.
+            ValueError: If none of the decision models worked.
+        """
+        assert len(decision_priority) > 0, "decision_priority must be non-empty"
+        assert len(questions) > 0, "questions must be non-empty"
+        raise_ = len(decision_priority) == 1
+
+        models = self._val_decision_priority_and_api_keys(decision_priority)
+        for idx, dp in enumerate(models, 1):
+            if idx > 1:
+                logger.warning(f"Falling back to {dp.model} by {dp.provider}...")
+
+            provider_llm = cast(
+                OpenAILLM | TypeSafeLLM, getattr(self, f"{dp.provider}_llm")
+            )
+            response = provider_llm.decide_sync(
+                model=dp.model, state=state, questions=questions, raise_=raise_
+            )
+            if response is not None:
+                return response
+
+        dps = [f"{dp.provider}: {dp.model}" for dp in models]
+        raise ValueError(f"Failed to decide with any of {dps}")
+
+    async def decide(
+        self,
+        decision_priority: List[DecisionChoice],
+        state: str,
+        questions: List[DecisionQuestion],
+    ) -> DecisionResponse:
+        """Ask a decision model typed questions about a state asynchronously.
+
+        Args:
+            decision_priority: Decision models to use in order of priority.
+            state: The shared evidence (text) the questions are asked about.
+            questions: Predicate, choice and score questions with unique names.
+
+        Returns:
+            The answers keyed by question name.
+
+        Raises:
+            AssertionError: If decision_priority or questions is empty.
+            ValueError: If none of the decision models worked.
+        """
+        assert len(decision_priority) > 0, "decision_priority must be non-empty"
+        assert len(questions) > 0, "questions must be non-empty"
+        raise_ = len(decision_priority) == 1
+
+        models = self._val_decision_priority_and_api_keys(decision_priority)
+        for idx, dp in enumerate(models, 1):
+            if idx > 1:
+                logger.warning(f"Falling back to {dp.model} by {dp.provider}...")
+
+            provider_llm = cast(
+                OpenAILLM | TypeSafeLLM, getattr(self, f"{dp.provider}_llm")
+            )
+            response = await provider_llm.decide(
+                model=dp.model, state=state, questions=questions, raise_=raise_
+            )
+            if response is not None:
+                return response
+
+        dps = [f"{dp.provider}: {dp.model}" for dp in models]
+        raise ValueError(f"Failed to decide with any of {dps}")

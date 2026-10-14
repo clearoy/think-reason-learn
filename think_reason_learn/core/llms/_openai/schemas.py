@@ -19,3 +19,20 @@ class OpenAIChoiceDict(TypedDict):
 
     provider: Literal["openai"]
     model: OpenAIChatModel
+
+
+OpenAIDecisionModel: TypeAlias = str | Literal["gpt-6-luna"]
+
+
+class OpenAIDecisionChoice(BaseModel):
+    """A decision model from OpenAI (Decisions API)."""
+
+    provider: Literal["openai"] = "openai"
+    model: OpenAIDecisionModel
+
+
+class OpenAIDecisionChoiceDict(TypedDict):
+    """A decision model from OpenAI (Decisions API)."""
+
+    provider: Literal["openai"]
+    model: OpenAIDecisionModel

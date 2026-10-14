@@ -19,11 +19,14 @@ from ._openai.schemas import (
     OpenAIChatModel,
     OpenAIChoice,
     OpenAIChoiceDict,
+    OpenAIDecisionChoice,
+    OpenAIDecisionChoiceDict,
     NotGiven as OpenAINotGiven,
     NOT_GIVEN as OPENAI_NOT_GIVEN,
 )
 from ._google.schemas import GoogleChatModel, GoogleChoice, GoogleChoiceDict
 from ._xai.schemas import xAIChatModel, XAIChoice, XAIChoiceDict
+from ._typesafe.schemas import TypeSafeDecisionChoice, TypeSafeDecisionChoiceDict
 
 
 T = TypeVar("T", bound=BaseModel | str, covariant=True)
@@ -49,6 +52,117 @@ LLMChoiceDict: TypeAlias = Union[
     XAIChoiceDict,
 ]
 LLMChoice: TypeAlias = LLMChoiceModel | LLMChoiceDict
+
+
+DecisionProvider: TypeAlias = Literal["openai", "typesafe"]
+DecisionChoiceModel: TypeAlias = Union[OpenAIDecisionChoice, TypeSafeDecisionChoice]
+DecisionChoiceDict: TypeAlias = Union[
+    OpenAIDecisionChoiceDict, TypeSafeDecisionChoiceDict
+]
+DecisionChoice: TypeAlias = DecisionChoiceModel | DecisionChoiceDict
+
+
+class PredicateQuestion(BaseModel):
+    """A yes/no question. Answered with the probability that it is true.
+
+    Maps to ``noul`` for TypeSafe and ``predicate`` for OpenAI.
+    """
+
+    type: Literal["predicate"] = "predicate"
+    name: str = Field(description="Unique name; the answer is keyed by it.")
+    instructions: str = Field(description="The yes/no question to evaluate.")
+    true_criteria: str | None = Field(
+        default=None, description="What makes the answer true."
+    )
+    false_criteria: str | None = Field(
+        default=None, description="What makes the answer false."
+    )
+
+
+class ChoiceQuestion(BaseModel):
+    """Pick exactly one option. Options are unordered."""
+
+    type: Literal["choice"] = "choice"
+    name: str = Field(description="Unique name; the answer is keyed by it.")
+    instructions: str = Field(description="What to choose between.")
+    choices: Dict[str, str] = Field(description="Option value -> its description.")
+
+
+class ScoreQuestion(BaseModel):
+    """Rate on an ordered rubric, from the lowest level to the highest."""
+
+    type: Literal["score"] = "score"
+    name: str = Field(description="Unique name; the answer is keyed by it.")
+    instructions: str = Field(description="What to rate.")
+    levels: List[str] = Field(
+        min_length=2,
+        max_length=10,
+        description="Level descriptions ordered lowest to highest.",
+    )
+
+
+DecisionQuestion: TypeAlias = Union[PredicateQuestion, ChoiceQuestion, ScoreQuestion]
+
+
+class PredicateAnswer(BaseModel):
+    """Answer to a ``PredicateQuestion``."""
+
+    type: Literal["predicate"] = "predicate"
+    name: str
+    probability: float = Field(description="Probability (0 to 1) that it is true.")
+
+
+class ChoiceAnswer(BaseModel):
+    """Answer to a ``ChoiceQuestion``."""
+
+    type: Literal["choice"] = "choice"
+    name: str
+    choice: str = Field(description="The highest-probability option.")
+    probabilities: Dict[str, float] = Field(description="Option -> probability.")
+    confidence: float | None = None
+
+
+class ScoreAnswer(BaseModel):
+    """Answer to a ``ScoreQuestion``."""
+
+    type: Literal["score"] = "score"
+    name: str
+    score: float = Field(
+        description="Probability-weighted level index; can fall between levels."
+    )
+    probabilities: Dict[str, float] = Field(description="Level -> probability.")
+    confidence: float | None = None
+
+
+class RefusalAnswer(BaseModel):
+    """The model declined to answer the question."""
+
+    type: Literal["refusal"] = "refusal"
+    name: str
+
+
+DecisionAnswer: TypeAlias = Union[
+    PredicateAnswer, ChoiceAnswer, ScoreAnswer, RefusalAnswer
+]
+
+
+class DecisionResponse(BaseModel):
+    """A response from a decision model."""
+
+    answers: Dict[str, DecisionAnswer] = Field(
+        description="The answers keyed by question name."
+    )
+    total_tokens: int | None = Field(
+        default=None, description="The total number of tokens used, if reported."
+    )
+    provider_model: DecisionChoiceModel = Field(
+        description="The provider and model used to generate the response."
+    )
+
+    def probability(self, name: str) -> float | None:
+        """Return the probability of a predicate answer, or None if unavailable."""
+        answer = self.answers.get(name)
+        return answer.probability if isinstance(answer, PredicateAnswer) else None
 
 
 class LLMResponse(BaseModel, Generic[T]):
