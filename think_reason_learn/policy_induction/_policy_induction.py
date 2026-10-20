@@ -530,14 +530,15 @@ class PolicyInduction(TRLModel):
         """Identifies a fit() run: the task, the generation setup and the data.
 
         A checkpoint written for anything else (other data, other batches, a
-        different task) must not be resumed.
+        different task) must not be resumed. The generator prompt is left out on
+        purpose: ``set_task()`` has the LLM write a new one on every call, so
+        including it would make a rerun of the same script never resume.
         """
         digest = hashlib.sha256()
         digest.update(
             repr(
                 (
                     self._task_description,
-                    self._pgen_instructions_template,
                     self.gen_batches,
                     self.max_raw_policies,
                     self.random_state,

@@ -416,6 +416,42 @@ async def test_resume_skips_generation_and_scored_cells(
 
 
 @pytest.mark.asyncio
+async def test_resume_survives_a_new_generator_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """set_task() writes a new prompt on every run; that must not defeat resume."""
+    monkeypatch.setattr(pi_module, "_SCORE_CHUNK", 5)
+    first = FakePolicyLLM()
+    calls = 0
+    original = first.answer_many
+
+    async def capped(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise JevCostCapError("Spend passed the cap.")
+        return await original(*args, **kwargs)
+
+    first.answer_many = capped  # type: ignore[method-assign]
+    pi = make_pi(tmp_path, first)
+    await pi.set_task(TASK)
+    with pytest.raises(JevCostCapError):
+        await pi.fit(X, LABELS)
+
+    second = FakePolicyLLM()
+    resumed = make_pi(tmp_path, second)
+    await resumed.set_task(TASK)
+    resumed._pgen_instructions_template = (
+        "Another prompt, as a fresh set_task() writes."
+    )
+    await resumed.fit(X, LABELS)
+
+    assert second.gen_queries == [] and second.merge_queries == []
+    assert len(second.answer_requests) == 10  # only the samples not yet scored
+    assert resumed.policies == pi.policies
+
+
+@pytest.mark.asyncio
 async def test_a_checkpoint_for_other_data_is_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
