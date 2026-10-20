@@ -39,7 +39,6 @@ def _tree(tmp_path: Path, **kwargs: Any) -> GPTree:
 
 METHODS: list[tuple[str, Callable[..., Any], str]] = [
     ("RRF", _rrf, "qanswer_llmc"),
-    ("PolicyInduction", _pi, "predict_llmc"),
     ("GPTree", _tree, "qanswer_llmc"),
 ]
 
@@ -155,3 +154,39 @@ async def test_a_loaded_jev_model_checks_the_key_before_spending_on_chat(
         await loaded.fit(pd.DataFrame({"data": ["a", "b"]}), ["YES", "NO"], reset=True)
 
     assert fake.calls == []
+
+
+def test_policy_induction_scores_with_jev_by_default(
+    tmp_path: Path, typesafe_key: None
+) -> None:
+    assert _pi(tmp_path).decision_llmc == JevChoice()
+
+
+def test_policy_induction_without_the_key_names_it_and_the_way_out(
+    tmp_path: Path, no_typesafe_key: None
+) -> None:
+    with pytest.raises(MissingAPIKeyError) as info:
+        _pi(tmp_path)
+
+    assert "TYPESAFE_API_KEY" in str(info.value)
+    assert "PolicyInduction" in str(info.value)
+
+
+def test_policy_induction_refuses_a_chat_scorer(
+    tmp_path: Path, typesafe_key: None
+) -> None:
+    with pytest.raises(ValueError, match="Jev"):
+        _pi(tmp_path, decision_llmc=CHAT[0])
+
+
+def test_a_saved_policy_induction_loads_without_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "test-key")
+    model = _pi(tmp_path)
+    model.save(tmp_path / "saved")
+    monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "")
+
+    loaded = PolicyInduction.load(tmp_path / "saved")
+
+    assert loaded.decision_llmc == JevChoice()

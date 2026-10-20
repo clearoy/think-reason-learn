@@ -63,7 +63,7 @@ Jev, Typesafe's System One model, answers them about each sample by default, so 
 (see [docs.typesafe.ai](https://docs.typesafe.ai)). Keys can go in the environment or in a git-ignored `.env` file.
 Each `fit()` or `predict()` prints its estimated Jev cost first and stops at a $10 cap unless you set another
 (`JevChoice(max_cost_usd=...)`). To answer with a chat model instead, pass it as the answering model, e.g.
-`RRF(qgen_llmc=llm, qanswer_llmc=llm)`, `GPTree(..., qanswer_llmc=llm)` or `PolicyInduction(..., predict_llmc=llm)`.
+`RRF(qgen_llmc=llm, qanswer_llmc=llm)` or `GPTree(..., qanswer_llmc=llm)`. Policy Induction always scores with Jev.
 
 ### Troubleshooting
 

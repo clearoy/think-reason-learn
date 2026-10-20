@@ -1,6 +1,31 @@
 Changelog
 =========
 
+Unreleased
+----------
+**Breaking:** Policy Induction is rebuilt around Jev. ``predict_llmc``, ``max_policy_length``, ``class_ratio``,
+``max_samples_as_context``, ``max_gen_batches``, ``policy_batch_size``, ``gen_temperature``,
+``predict_temperature`` and ``llm_semaphore_limit`` are gone, and ``set_task`` no longer takes an
+``instructions_template``. Models saved by earlier versions do not load (refit them).
+
+- ``decision_llmc`` is the only scorer and must be Jev (``JevChoice()`` by default, which needs
+  ``TYPESAFE_API_KEY``). Policies can no longer be scored with a chat model.
+- Generation is ``gen_batches=((a, b), n)``: ``n`` batches, each showing ``a`` YES and ``b`` NO samples, written
+  independently and in parallel. Batches share no samples, so ``fit()`` raises ``DataError`` before any request
+  if the data has fewer than ``a * n`` YES or ``b * n`` NO rows. The default is ``((5, 5), 7)``.
+- The same ``gen_llmc`` then merges the batches' policies and compresses them to at most ``max_raw_policies``
+  (default 30), which are all scored. The merge is asked again once if it returns too many, then truncated.
+- Policies are guidance, not facts. Jev is asked, for each sample, whether the answer to the task is YES when
+  guided by the policy; the task is sent once per sample, not once per policy. The regression's features are
+  Jev's probability of YES, not a 0/1 answer, and ``predict()`` yields those probabilities in its vector.
+- The weight fit regularises strongly by default so that few policies survive: ``Cs`` is
+  ``(0.01, 0.03, 0.1, 0.3, 1.0)`` and the new ``one_se_rule`` (on by default) picks the most regularised ``C``
+  within one standard error of the best cross-validated F-beta. A ``C`` that leaves every policy at zero weight
+  is never chosen.
+- The fit checkpoint holds each batch's policies, the merged list and the scored cells (as probabilities), so an
+  interrupted ``fit()`` resumes without regenerating or re-asking Jev. A checkpoint is resumed only for the same
+  task, settings and data.
+
 0.2.0
 -----
 **Breaking:** code that relied on answers defaulting to the generation model now answers with Jev and needs

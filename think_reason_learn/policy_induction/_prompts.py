@@ -1,6 +1,4 @@
-max_policy_num_tag = "<max_policy_length>"
-
-POLICY_GEN_INSTRUCTIONS = f"""\
+POLICY_GEN_INSTRUCTIONS = """\
 You are part of an intelligent team of LLMs collaborating on a binary
 classification task.
 
@@ -8,89 +6,54 @@ Given:
 - A task description.
 
 Task:
-- Generate a prompt/instructions template that will be sent to another LLM
-  (the policy generator).
-- This prompt template should instruct the policy-generator LLM to
-  **enrich existing policies** for the binary classification task.
-- The policy-generator LLM will receive:
-  1. The task description.
-  2. A set of existing policies from previous rounds.
-  3. Newly collected data samples with their binary labels.
-- The goal of the policy-generator LLM is not to replace or discard existing
-  policies, but to expand and enrich them — by incorporating insights from new
-  data, clarifying ambiguous logic, generalizing existing decision rules, and
-  introducing new policies when novel patterns or principles emerge.
+- Write a prompt/instructions template for another LLM (the policy generator).
+- The policy generator receives the task description and a small batch of
+  labelled samples (some YES, some NO). It sees nothing else.
+- It must write policies: general guidance that a decision-maker could use to
+  decide whether the answer to the task is YES for any new sample.
 
-- The policies generated should be:
-  1. Generalizable: extract broader patterns, not case-specific details.
-  2. Transferable: focus on underlying signals that apply beyond single examples.
-  3. Concise: keep each policy clear and actionable in one sentence.
-  4. Non-overfitting: avoid policies too specific to individual samples.
-  5. Bounded: do not exceed {max_policy_num_tag} total policies.
-
-- The resulting prompt should provide high-level guidance on what the policy
-  generator should consider and how to approach refinement, without prescribing
-  exact rules or features.
-- Ensure the template includes the placeholder {max_policy_num_tag} (not any
-  exact number), which will be dynamically substituted at runtime.
+The template must tell the policy generator that policies should be:
+  1. Guidance, not facts: say what to weigh or look for (for example "Give
+     weight to ..."), never a claim that is simply true or false of one sample.
+  2. Generalizable: capture broader patterns, not details of a single sample.
+  3. Transferable: focus on signals that apply beyond the samples shown.
+  4. Concise: one clear, actionable sentence each.
+  5. Non-overfitting: never mention a specific sample, name or value.
+- The generator is free to write as many policies as the batch supports. A
+  later step merges and trims them, so it must not worry about a limit.
+- Policies may point towards YES or towards NO.
 
 Return:
-- Only the text of the prompt/instructions template for the policy-generator LLM.
+- Only the text of the prompt/instructions template for the policy generator.
 """
 
-POLICY_PREDICT_INSTRUCTIONS = """\
-You are a deterministic classification agent.
+POLICY_MERGE_INSTRUCTIONS = """\
+You are part of an intelligent team of LLMs collaborating on a binary
+classification task.
 
 Given:
-- A task description
-- A policy
-- A single sample (text)
+- A task description.
+- A list of policies. Each is guidance for deciding whether the answer to the
+  task is YES. They were written independently from different batches of
+  samples, so many overlap or repeat one another.
 
-Objective:
-Classify the sample as either "YES" or "NO" according to the policy
-and the task description.
+Task:
+- Merge the policies into one list of AT MOST {max_policies} policies.
+- Combine policies that say the same thing or nearly the same thing.
+- Keep the most general and most useful guidance; drop policies that are
+  vague, redundant, or specific to a single case.
+- Keep each policy a concise, actionable one-sentence piece of guidance.
+- Do not invent guidance that none of the input policies support.
 
-Requirements:
-- Base your decision strictly on the given policy and sample content.
-- Be deterministic: the same input must always yield the same output.
-- Do not explain your reasoning or include any punctuation.
-
-Output format:
-Return ONLY ONE WORD: YES / NO.
+Return the final list of policies.
 """
 
-POLICY_PREDICT_BATCH_INSTRUCTIONS = """\
-You are a deterministic classification agent.
-
-Given:
-- A task description
-- A numbered list of policies, each labelled with a unique integer id
-- A single sample (text)
-
-Objective:
-For EVERY policy in the list, classify the sample as either "YES" or "NO"
-according to that policy and the task description.
-
-Requirements:
-- Judge each policy INDEPENDENTLY. A policy's answer must not be influenced
-  by any other policy in the list, by their order, or by how many YES or NO
-  answers you have already produced. Treat each one as if it were the only
-  policy you had been given.
-- Base each decision strictly on that policy, the sample content, and the
-  task description.
-- Be deterministic: the same input must always yield the same output.
-- Return exactly one answer for every policy id — no more, no fewer.
-- Echo each policy's id exactly as it appears in the list. Do not renumber
-  or invent ids.
-- Do not explain your reasoning.
-
-Output format:
-One entry per policy, each carrying that policy's id and its answer (YES / NO).
-"""
-
-
-POLICY_PREDICT_JEV_TEMPLATE = """\
+POLICY_JEV_STATE = """\
 Task: {task_description}
-Policy (guidance, not a strict rule): {policy}
-Considering this policy along with the sample's full content, is the answer to \
-the task YES?"""
+
+Sample:
+{sample}"""
+
+POLICY_JEV_QUESTION = """\
+Use this policy as guidance for your decision: {policy}
+Is the answer to the task YES?"""

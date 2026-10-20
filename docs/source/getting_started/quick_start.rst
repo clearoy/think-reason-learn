@@ -44,8 +44,8 @@ Who answers the questions
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The chat model above writes the tree's questions. Jev, Typesafe's System One model, answers them for each profile:
-it is the default answering model in GPTree, Random Rule Forest (``qanswer_llmc``) and Policy Induction
-(``predict_llmc``). Jev reads one sample and answers all the questions about it in one request, so the sample is paid
+it is the default answering model in GPTree and Random Rule Forest (``qanswer_llmc``), and the only scorer in
+Policy Induction (``decision_llmc``). Jev reads one sample and answers all the questions about it in one request, so the sample is paid
 for once rather than once per question. Labels are never sent to it.
 
 Before a run spends anything, the library prints the estimated cost. Each ``fit()`` or ``predict()`` stops if the

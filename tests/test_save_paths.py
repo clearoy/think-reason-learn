@@ -15,6 +15,8 @@ from think_reason_learn.rrf import RRF
 
 CHAT: list[LLMChoice] = [OpenAIChoice(model="gpt-4.1-nano")]
 
+pytestmark = pytest.mark.usefixtures("typesafe_key")
+
 
 def _rrf(**kwargs: Any) -> RRF:
     return RRF(qgen_llmc=CHAT, qanswer_llmc=CHAT, name="m", **kwargs)
@@ -32,9 +34,7 @@ def _tree(**kwargs: Any) -> GPTree:
 
 
 def _pi(**kwargs: Any) -> PolicyInduction:
-    return PolicyInduction(
-        gen_llmc=CHAT, predict_llmc=CHAT, name="m", confirm_requests=False, **kwargs
-    )
+    return PolicyInduction(gen_llmc=CHAT, name="m", confirm_requests=False, **kwargs)
 
 
 def _rrm(**kwargs: Any) -> ReasonedRuleMining:
@@ -93,7 +93,7 @@ def test_load_then_save_writes_back_in_place(
     [
         (_rrf, ["answers.parquet", "answer_probs.parquet", "data.parquet"]),
         (_tree, ["data.parquet"]),
-        (_pi, ["data.parquet", "policy_predictions.parquet"]),
+        (_pi, ["data.parquet", "policy_scores.parquet"]),
     ],
 )
 def test_production_save_removes_training_files_left_in_place(

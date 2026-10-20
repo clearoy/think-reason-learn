@@ -13,6 +13,8 @@ from think_reason_learn.policy_induction import PolicyInduction
 from think_reason_learn.rrf import RRF
 
 CHAT: list[LLMChoice] = [OpenAIChoice(model="gpt-4.1-nano")]
+
+pytestmark = pytest.mark.usefixtures("typesafe_key")
 X = pd.DataFrame({"text": ["a", "b", "c", "d"]})
 
 
@@ -21,9 +23,7 @@ def _rrf(tmp_path: Path) -> RRF:
 
 
 def _pi(tmp_path: Path) -> PolicyInduction:
-    return PolicyInduction(
-        gen_llmc=CHAT, predict_llmc=CHAT, save_path=tmp_path, confirm_requests=False
-    )
+    return PolicyInduction(gen_llmc=CHAT, save_path=tmp_path, confirm_requests=False)
 
 
 @pytest.mark.parametrize("make", [_rrf, _pi])

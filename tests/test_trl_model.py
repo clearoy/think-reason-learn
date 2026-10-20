@@ -18,6 +18,8 @@ from think_reason_learn.rrf import RRF
 from think_reason_learn.verifiable_rl import VerifiableRL
 
 CHAT: list[LLMChoice] = [OpenAIChoice(model="gpt-4.1-nano")]
+
+pytestmark = pytest.mark.usefixtures("typesafe_key")
 TEMPLATE = "Ask <number_of_questions> questions about founders."
 
 
@@ -36,7 +38,7 @@ def _tree(name: str | None = None) -> GPTree:
 
 
 def _pi(name: str | None = None) -> PolicyInduction:
-    return PolicyInduction(gen_llmc=CHAT, predict_llmc=CHAT, name=name)
+    return PolicyInduction(gen_llmc=CHAT, name=name)
 
 
 def _rrm(name: str | None = None) -> ReasonedRuleMining:

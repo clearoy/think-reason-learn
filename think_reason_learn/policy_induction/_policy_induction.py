@@ -1,14 +1,15 @@
 """Policy Induction.
 
-An interpretable ensemble binary classifier using LLM-induced policies
-weighted by logistic regression.
+An interpretable ensemble framework for binary classification: an LLM writes
+general guidance policies from labelled batches, Jev scores how each policy
+moves the answer for every sample, and a strongly regularised logistic
+regression keeps the few policies that matter.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import itertools
 import logging
 import math
 import re
@@ -22,7 +23,6 @@ from typing import (
     Any,
     AsyncGenerator,
     Dict,
-    Generator,
     Iterable,
     List,
     Literal,
@@ -54,7 +54,9 @@ from think_reason_learn.core.exceptions import (
     LLMError,
 )
 from think_reason_learn.core.llms import (
+    JevBudget,
     JevChoice,
+    JevChoiceDict,
     JevQuestion,
     JevRequest,
     LLMChoice,
@@ -67,17 +69,12 @@ from think_reason_learn.core.llms._jev.client import (
     loading_saved_model,
     require_typesafe_key,
 )
-from think_reason_learn.core.llms._jev.schemas import (
-    YES_THRESHOLD,
-    answers_with_jev,
-    yes_no,
-)
+from think_reason_learn.core.llms._jev.schemas import is_jev
 from ._prompts import (
     POLICY_GEN_INSTRUCTIONS,
-    POLICY_PREDICT_BATCH_INSTRUCTIONS,
-    POLICY_PREDICT_INSTRUCTIONS,
-    POLICY_PREDICT_JEV_TEMPLATE,
-    max_policy_num_tag,
+    POLICY_JEV_QUESTION,
+    POLICY_JEV_STATE,
+    POLICY_MERGE_INSTRUCTIONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +82,16 @@ logger = logging.getLogger(__name__)
 # Compact terminal-style progress bar: "[TAG] ████░░░░ n/total · rate/s · eta MM:SS"
 _BAR_FORMAT = "{desc} {bar} {n_fmt}/{total_fmt} · {rate_fmt} · eta {remaining}"
 _BAR_ASCII = "░█"
+
+# Generation is sampled for variety; set_task and the merge want a stable answer.
+_GEN_TEMPERATURE = 1.0
+_MERGE_TEMPERATURE = 0.0
+
+# Samples sent to Jev per call, so a checkpoint is written every this many.
+_SCORE_CHUNK = 50
+_PREDICT_CHUNK = 50
+
+_MANIFEST_VERSION = 4
 
 
 def _penalty_kwargs(
@@ -114,25 +121,6 @@ class Policies(BaseModel):
     policies: List[str] = Field(..., description="The list of generated policies.")
 
 
-class Answer(BaseModel):
-    answer: Literal["YES", "NO"]
-
-
-class PolicyAnswer(BaseModel):
-    policy_id: int = Field(
-        ...,
-        description="Id of the policy this answer applies to, copied exactly "
-        "from the policy list in the prompt.",
-    )
-    answer: Literal["YES", "NO"]
-
-
-class BatchedAnswers(BaseModel):
-    answers: List[PolicyAnswer] = Field(
-        ..., description="Exactly one answer per policy id given in the prompt."
-    )
-
-
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 
@@ -140,11 +128,19 @@ class BatchedAnswers(BaseModel):
 class WeightTrainerConfig:
     """Configuration for training and optimizing ensemble weights.
 
+    The defaults favour few final policies: an L1 penalty, a grid of strong
+    regularisation strengths, and the one-standard-error rule, which picks the
+    most regularised ``C`` whose CV score is within one standard error of the
+    best.
+
     Args:
         beta: Beta for F-beta score (e.g. 0.5 weights precision more).
         penalty: Regularization type for logistic regression.
         cv_folds: Number of StratifiedKFold splits.
-        Cs: Candidate regularization strengths.
+        Cs: Candidate regularization strengths. Smaller means stronger, so
+            fewer policies keep a non-zero weight.
+        one_se_rule: Pick the strongest ``C`` within one standard error of the
+            best CV score instead of the best-scoring ``C``.
         threshold_grid: Decision thresholds to search over CV folds.
         class_weight_balanced: Use class_weight='balanced' in LR.
         random_state: Random seed for CV splits.
@@ -153,7 +149,8 @@ class WeightTrainerConfig:
     beta: float = 0.5
     penalty: Literal["l1", "l2"] = "l1"
     cv_folds: int = 5
-    Cs: Iterable[float] = (1e-3, 1e-2, 1e-1, 1, 10, 100, 1000)
+    Cs: Iterable[float] = (0.01, 0.03, 0.1, 0.3, 1.0)
+    one_se_rule: bool = True
     threshold_grid: Iterable[float] = tuple(np.linspace(0.01, 0.99, 99))
     class_weight_balanced: bool = False
     random_state: int = 0
@@ -165,36 +162,29 @@ class WeightTrainerConfig:
 class PolicyInduction(TRLModel):
     """Interpretable ensemble binary classifier.
 
-    Induces natural-language policies from labeled data via LLM, scores each
-    policy against every sample, then trains a logistic regression to find the
-    optimal weighted combination for YES/NO prediction.
+    ``fit`` runs five steps:
+
+    1. Each generation batch independently writes general policies from its
+       own labelled samples.
+    2. The same LLM merges the policies and compresses them to at most
+       ``max_raw_policies``.
+    3. Jev scores every (sample, policy) pair: its probability of YES when
+       guided by that policy.
+    4. A strongly regularised logistic regression weights those probabilities
+       and keeps few policies.
+    5. A decision threshold is tuned on CV folds.
 
     Args:
-        gen_llmc: LLMs for policy generation, in priority order.
-        predict_llmc: LLMs for prediction. Defaults to Jev (``[JevChoice()]``),
-            which needs ``TYPESAFE_API_KEY``; pass a chat model here to predict
-            with it instead. With Jev first, each sample is sent once with every policy
-            to score, and Jev's probability counts as YES at or above 0.5.
+        gen_llmc: LLMs that write and merge policies, in priority order.
+        decision_llmc: Jev, the model that scores policies. Defaults to
+            ``JevChoice()``, which needs ``TYPESAFE_API_KEY``. Jev is the only
+            supported scorer.
+        gen_batches: ``((a, b), n)``: ``n`` independent batches, each showing
+            ``a`` YES and ``b`` NO samples. Batches share no samples, so the
+            data needs at least ``a * n`` YES and ``b * n`` NO rows.
+        max_raw_policies: The most policies the merge step keeps, which are
+            all scored. Fewer policies end up in the final model.
         config: Weight training configuration.
-        gen_temperature: Sampling temperature for generation.
-        predict_temperature: Sampling temperature for prediction.
-        llm_semaphore_limit: Max concurrent LLM calls.
-        max_policy_length: Max total policies to induce (< 500).
-        class_ratio: Target YES/NO mix per generation batch, not the dataset's
-            actual ratio. Generation stops once either class can no longer
-            fill its share, so imbalanced datasets won't have every
-            majority-class row shown during generation.
-        max_samples_as_context: Samples per generation batch (max 100).
-        max_gen_batches: Cap on the number of generation batches. Generation
-            stops at this many batches even if both classes still have rows
-            left. None (the default) stops only once either class runs out.
-        policy_batch_size: Number of policies judged per LLM call (1-50). One
-            call carries one sample and up to this many policies, returning
-            one answer per policy. 1 restores the original one-call-per-
-            (policy, sample) behaviour. Answers missing from a batch response
-            are re-queried individually. The same value governs both fit-time
-            scoring and predict(), so features are always drawn the same way.
-        p_predict_update_interval: Log progress every N LLM calls during scoring.
         save_path: Directory for checkpoints and saved models.
         name: Instance name (alphanumeric + underscores only).
         random_state: Base random seed.
@@ -209,17 +199,10 @@ class PolicyInduction(TRLModel):
     def __init__(
         self,
         gen_llmc: List[LLMChoice],
-        predict_llmc: List[LLMChoice] | None = None,
+        decision_llmc: JevChoice | JevChoiceDict | None = None,
+        gen_batches: Tuple[Tuple[int, int], int] = ((5, 5), 7),
+        max_raw_policies: int = 30,
         config: WeightTrainerConfig | dict | None = None,
-        gen_temperature: float = 1.0,
-        predict_temperature: float = 0.0,
-        llm_semaphore_limit: int = 3,
-        max_policy_length: int = 20,
-        class_ratio: Tuple[float, float] = (1.0, 1.0),
-        max_samples_as_context: int = 10,
-        max_gen_batches: int | None = None,
-        policy_batch_size: int = 10,
-        p_predict_update_interval: int = 10,
         save_path: str | PathLike[str] | None = None,
         name: str | None = None,
         random_state: int = 0,
@@ -227,46 +210,38 @@ class PolicyInduction(TRLModel):
         _llm: Any = None,
     ):
         self._validate_init(
-            max_policy_length=max_policy_length,
-            class_ratio=class_ratio,
-            llm_semaphore_limit=llm_semaphore_limit,
-            max_gen_batches=max_gen_batches,
-            policy_batch_size=policy_batch_size,
-            p_predict_update_interval=p_predict_update_interval,
+            gen_llmc=gen_llmc,
+            gen_batches=gen_batches,
+            max_raw_policies=max_raw_policies,
             save_path=save_path,
             name=name,
-            gen_temperature=gen_temperature,
-            predict_temperature=predict_temperature,
         )
         self.gen_llmc = gen_llmc
-        self.predict_llmc: List[LLMChoice] = predict_llmc or [JevChoice()]
+        self.decision_llmc: JevChoice = self._parse_decision_llmc(decision_llmc)
         require_typesafe_key(
-            self.predict_llmc, method="PolicyInduction", param="predict_llmc"
+            [self.decision_llmc], method="PolicyInduction", param="decision_llmc"
         )
-        self.gen_temperature = gen_temperature
-        self.predict_temperature = predict_temperature
-        self._llm_semaphore_limit = llm_semaphore_limit
+        self.gen_batches: Tuple[Tuple[int, int], int] = (
+            (int(gen_batches[0][0]), int(gen_batches[0][1])),
+            int(gen_batches[1]),
+        )
+        self.max_raw_policies = max_raw_policies
         self.config: WeightTrainerConfig = self._parse_config(config)
-        self.class_ratio = class_ratio
-        self.max_policy_length = max_policy_length
         self.random_state = random_state
-        self.max_samples_as_context = max_samples_as_context
-        self.max_gen_batches = max_gen_batches
-        self.policy_batch_size = policy_batch_size
-        self.p_predict_update_interval = p_predict_update_interval
         self.confirm_requests = confirm_requests
         self.name: str = self._get_name(name)
         self.save_path: Path = self._set_save_path(save_path)
 
         self._llm_instance: Any = _llm if _llm is not None else llm
         self._token_counter: TokenCounter = TokenCounter()
-        self._llm_semaphore = asyncio.Semaphore(llm_semaphore_limit)
         self._pgen_instructions_template: str | None = None
         self._task_description: str | None = None
 
         self._X: pd.DataFrame | None = None
         self._y: npt.NDArray[np.str_] | None = None
-        self._policy_memory: pd.DataFrame = self._empty_memory()
+        self._policies: List[str] = []
+        # Samples x policies, Jev's P(YES) with NaN where not scored yet.
+        self._scores: NDArray[np.float64] | None = None
         self._threshold: float = 0.0
         self._lr: LogisticRegression | None = None
         self._validation_result: dict | None = None
@@ -300,48 +275,51 @@ class PolicyInduction(TRLModel):
         return self._validation_result
 
     @property
-    def llm_semaphore_limit(self) -> int:
-        return self._llm_semaphore_limit
-
-    @llm_semaphore_limit.setter
-    def llm_semaphore_limit(self, value: int) -> None:
-        self._llm_semaphore_limit = value
-        self._llm_semaphore = asyncio.Semaphore(value)
-
-    @property
     def policy_gen_instructions_template(self) -> str | None:
         return self._pgen_instructions_template
 
+    @property
+    def policies(self) -> List[str]:
+        """The merged policies that were scored (before the regression prunes)."""
+        return list(self._policies)
+
     # ── Validation helpers ──────────────────────────────────────────────────────
 
-    def _validate_init(self, **kw: Any) -> None:
-        if not (0 < kw["max_policy_length"] < 500):
-            raise ValueError("max_policy_length must be > 0 and < 500")
-        if not (len(kw["class_ratio"]) == 2 and all(v > 0 for v in kw["class_ratio"])):
-            raise ValueError("class_ratio must be two positive floats")
-        if kw["llm_semaphore_limit"] <= 0:
-            raise ValueError("llm_semaphore_limit must be > 0")
-        mgb = kw["max_gen_batches"]
-        if not (
-            mgb is None
-            or (isinstance(mgb, int) and not isinstance(mgb, bool) and mgb > 0)
-        ):
-            raise ValueError("max_gen_batches must be None or a positive integer")
-        # Upper bound guards against output-token truncation: the LLM layer has
-        # no retry, and a truncated structured response is a hard parse failure.
-        pbs = kw["policy_batch_size"]
-        if not (isinstance(pbs, int) and not isinstance(pbs, bool) and 0 < pbs <= 50):
-            raise ValueError("policy_batch_size must be an int in [1, 50]")
-        if kw["p_predict_update_interval"] <= 0:
-            raise ValueError("p_predict_update_interval must be > 0")
+    @staticmethod
+    def _validate_init(**kw: Any) -> None:
+        if not kw["gen_llmc"]:
+            raise ValueError("gen_llmc must be a non-empty list")
+        batches = kw["gen_batches"]
+        try:
+            (pos, neg), n = batches
+            ints = all(
+                isinstance(v, int) and not isinstance(v, bool) for v in (pos, neg, n)
+            )
+        except (TypeError, ValueError):
+            raise ValueError("gen_batches must look like ((a, b), n)") from None
+        if not ints or pos < 0 or neg < 0 or pos + neg < 1 or n < 1:
+            raise ValueError(
+                "gen_batches ((a, b), n) needs integers a, b >= 0 with a + b >= 1 "
+                "and n >= 1"
+            )
+        mrp = kw["max_raw_policies"]
+        if not (isinstance(mrp, int) and not isinstance(mrp, bool) and 0 < mrp < 500):
+            raise ValueError("max_raw_policies must be an int in [1, 499]")
         if not (kw["save_path"] is None or isinstance(kw["save_path"], (str, Path))):
             raise ValueError("save_path must be None, str, or Path")
         if not (kw["name"] is None or isinstance(kw["name"], str)):
             raise ValueError("name must be None or str")
-        if not (0 <= kw["gen_temperature"] <= 2):
-            raise ValueError("gen_temperature must be in [0, 2]")
-        if not (0 <= kw["predict_temperature"] <= 2):
-            raise ValueError("predict_temperature must be in [0, 2]")
+
+    @staticmethod
+    def _parse_decision_llmc(choice: JevChoice | JevChoiceDict | None) -> JevChoice:
+        if choice is None:
+            return JevChoice()
+        if not is_jev(choice):
+            raise ValueError(
+                "decision_llmc must be a JevChoice: Jev is the only model that "
+                "scores policies."
+            )
+        return choice if isinstance(choice, JevChoice) else JevChoice(**choice)
 
     def _parse_config(
         self, cfg: Union[None, WeightTrainerConfig, dict]
@@ -364,14 +342,6 @@ class PolicyInduction(TRLModel):
 
     # ── Data management ─────────────────────────────────────────────────────────
 
-    def _empty_memory(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "policy": pd.Series([], dtype=str),
-                "predictions": pd.Series([], dtype=object),
-            }
-        )
-
     def _set_data(self, X: pd.DataFrame, y: Sequence[str]) -> None:
         if not all(isinstance(v, str) for v in y):
             raise DataError("y must be a sequence of strings")
@@ -384,64 +354,49 @@ class PolicyInduction(TRLModel):
         self._X = deepcopy(X).reset_index(drop=True)
         self._y = deepcopy(y_arr)
 
-    def _sample(
-        self, n: int, seed: int | None = None
-    ) -> Generator[pd.DataFrame, None, None]:
-        """Yield balanced batches of n samples, stopping once either class runs out.
+    def _batch_indices(self) -> List[NDArray[np.intp]]:
+        """Row positions of each generation batch; batches never share a row.
 
-        Each batch draws exactly the class_ratio-determined share of YES/NO
-        samples. Generation stops as soon as one class can no longer fill its
-        share, rather than topping batches up from the other class — on an
-        imbalanced dataset, this means not every majority-class row is shown
-        during generation (scoring and weight fitting still use all of them).
+        Raises:
+            DataError: There are too few YES or NO rows for ``gen_batches``.
         """
-        rng = np.random.default_rng(seed if seed is not None else self.random_state)
-        yes_idx = rng.permutation(np.where(self._y == "YES")[0])
-        no_idx = rng.permutation(np.where(self._y == "NO")[0])
-
-        p_yes = self.class_ratio[0] / sum(self.class_ratio)
-        want_yes = int(round(n * p_yes))
-        want_no = n - want_yes
-
-        taken_y = taken_n = 0
-        len_yes, len_no = len(yes_idx), len(no_idx)
-
-        while True:
-            take_y = min(want_yes, len_yes - taken_y)
-            take_n = min(want_no, len_no - taken_n)
-            if take_y < want_yes or take_n < want_no:
-                break
-
+        (pos, neg), n = self.gen_batches
+        y = cast(NDArray[np.str_], self._y)
+        yes_idx = np.where(y == "YES")[0]
+        no_idx = np.where(y == "NO")[0]
+        if len(yes_idx) < pos * n or len(no_idx) < neg * n:
+            fit_n = min(
+                len(yes_idx) // pos if pos else n, len(no_idx) // neg if neg else n
+            )
+            raise DataError(
+                f"gen_batches (({pos}, {neg}), {n}) needs {pos * n} YES and "
+                f"{neg * n} NO rows without reuse, but the data has "
+                f"{len(yes_idx)} YES and {len(no_idx)} NO. Lower n (at most "
+                f"{fit_n} fits) or a / b."
+            )
+        rng = np.random.default_rng(self.random_state)
+        yes_idx = rng.permutation(yes_idx)
+        no_idx = rng.permutation(no_idx)
+        batches: List[NDArray[np.intp]] = []
+        for i in range(n):
             batch = np.concatenate(
-                [
-                    yes_idx[taken_y : taken_y + take_y],
-                    no_idx[taken_n : taken_n + take_n],
-                ]
+                [yes_idx[i * pos : (i + 1) * pos], no_idx[i * neg : (i + 1) * neg]]
             )
             rng.shuffle(batch)
-            df = self._X.iloc[batch].copy()  # type: ignore
-            df["y"] = self._y[batch]  # type: ignore
-            yield df
+            batches.append(batch)
+        return batches
 
-            taken_y += take_y
-            taken_n += take_n
+    @staticmethod
+    def _render_sample(row: pd.Series) -> str:
+        return "\n".join(f"{col}: {row[col]}" for col in row.index)
 
     # ── Task / instructions ─────────────────────────────────────────────────────
 
-    async def set_task(
-        self,
-        task_description: str,
-        instructions_template: str | None = None,
-    ) -> str:
-        """Set the task description and obtain the policy generation template.
-
-        Either accepts a custom template or generates one via LLM from the
-        task description. The template must contain '<max_policy_length>'.
+    async def set_task(self, task_description: str) -> str:
+        """Set the task description and have the LLM write the generator prompt.
 
         Args:
             task_description: Description of the binary classification task.
-            instructions_template: Optional custom template. If None, generated
-                via LLM.
 
         Returns:
             The policy generation instructions template string.
@@ -449,29 +404,20 @@ class PolicyInduction(TRLModel):
         assert task_description, "task_description must be provided"
         self._task_description = task_description
 
-        if instructions_template:
-            if max_policy_num_tag not in instructions_template:
-                raise ValueError(
-                    f"instructions_template must contain '{max_policy_num_tag}'"
-                )
-            self._pgen_instructions_template = instructions_template
-            return instructions_template
-
-        async with self._llm_semaphore:
-            response = await self._llm_instance.respond(
-                query=f"Generate policies for:\n{task_description}",
-                llm_priority=self.gen_llmc,
-                response_format=str,
-                instructions=POLICY_GEN_INSTRUCTIONS,
-                temperature=self.gen_temperature,
-            )
+        response = await self._llm_instance.respond(
+            query=f"Generate policies for:\n{task_description}",
+            llm_priority=self.gen_llmc,
+            response_format=str,
+            instructions=POLICY_GEN_INSTRUCTIONS,
+            temperature=_GEN_TEMPERATURE,
+        )
         await self._token_counter.append(
             provider=response.provider_model.provider,
             model=response.provider_model.model,
             value=response.total_tokens,
             caller="PolicyInduction.set_task",
         )
-        if not response.response or max_policy_num_tag not in response.response:
+        if not response.response or not response.response.strip():
             raise ValueError(
                 "Failed to generate a valid instructions template. "
                 "Refine the task description or switch models."
@@ -479,33 +425,7 @@ class PolicyInduction(TRLModel):
         self._pgen_instructions_template = response.response
         return response.response
 
-    def _get_gen_instructions(self) -> str:
-        if not self._pgen_instructions_template:
-            raise ValueError("Call set_task() before fit().")
-        return self._pgen_instructions_template.replace(
-            max_policy_num_tag, str(self.max_policy_length)
-        )
-
     # ── Request confirmation ────────────────────────────────────────────────────
-
-    @property
-    def _scores_with_jev(self) -> bool:
-        return answers_with_jev(self.predict_llmc)
-
-    def _jev_question(self, policy: str) -> NoulQuestion:
-        return NoulQuestion(
-            instructions=POLICY_PREDICT_JEV_TEMPLATE.format(
-                task_description=self._task_description, policy=policy
-            )
-        )
-
-    @staticmethod
-    def _jev_requests_per_sample(n_policies: int) -> int:
-        return math.ceil(n_policies / MAX_QUESTIONS_PER_REQUEST)
-
-    @staticmethod
-    def _llmc_label(llmc: LLMChoice) -> str:
-        return llmc["model"] if isinstance(llmc, dict) else llmc.model
 
     def _confirm_requests(self, estimates: Dict[str, int]) -> None:
         """Print an estimated request count per model and require y/n to proceed.
@@ -523,80 +443,57 @@ class PolicyInduction(TRLModel):
         if answer not in ("y", "yes"):
             raise RuntimeError("Aborted by user before making API requests.")
 
+    @staticmethod
+    def _llmc_label(llmc: LLMChoice | JevChoice) -> str:
+        return llmc["model"] if isinstance(llmc, dict) else llmc.model
+
+    @staticmethod
+    def _jev_requests_per_sample(n_policies: int) -> int:
+        return math.ceil(n_policies / MAX_QUESTIONS_PER_REQUEST)
+
     def _estimate_fit_requests(self) -> Dict[str, int]:
-        """Estimate remaining LLM calls for fit(), accounting for any checkpoint.
-
-        Approximate: answers missing from a batched response are re-queried
-        individually, which can add up to policy_batch_size - 1 extra calls
-        per batch.
-        """
-        ckpt = self._read_ckpt(self._FIT_CKPT_NAME) or {}
-        batches_done: int = ckpt.get("batches_done", 0)
-        total_batches = sum(
-            1
-            for _ in itertools.islice(
-                self._sample(self.max_samples_as_context, seed=self.random_state),
-                self.max_gen_batches,
-            )
+        """Estimate remaining LLM calls for fit(), accounting for any checkpoint."""
+        ckpt = self._load_fit_ckpt()
+        if self._policies or ckpt.get("merged"):
+            gen_remaining = 0
+        else:
+            gen_remaining = self.gen_batches[1] - len(ckpt.get("batches", {})) + 1
+        n_policies = len(self._policies or ckpt.get("merged") or []) or (
+            self.max_raw_policies
         )
-        gen_remaining = max(total_batches - batches_done, 0)
-
-        policies = ckpt.get("policies")
-        n_policies = len(policies) if policies else self.max_policy_length
-        scores: dict = ckpt.get("scores", {})
-
-        # Scoring is sample-major (one call per sample per policy chunk) while
-        # the checkpoint is policy-major, so pivot to per-sample counts first.
-        # A cell counts as remaining when it is absent OR explicitly None.
-        sample_keys = [str(i) for i in self._X.index] if self._X is not None else []
-        missing_per_sample: Dict[str, int] = {k: 0 for k in sample_keys}
-        for i in range(n_policies):
-            existing = scores.get(str(i)) or {}
-            for k in sample_keys:
-                if existing.get(k) is None:
-                    missing_per_sample[k] += 1
-        score_remaining = sum(
-            math.ceil(c / self.policy_batch_size)
-            for c in missing_per_sample.values()
-            if c
-        )
-        if self._scores_with_jev and score_remaining:
-            score_remaining = len(sample_keys) * self._jev_requests_per_sample(
-                n_policies
+        n_samples = len(self._X) if self._X is not None else 0
+        done = ckpt.get("scores", {})
+        full_samples = n_samples
+        if done and n_policies:
+            full_samples = sum(
+                1
+                for s in range(n_samples)
+                if any(str(s) not in done.get(str(p), {}) for p in range(n_policies))
             )
-
         return {
             f"{self._llmc_label(self.gen_llmc[0])} (generation)": gen_remaining,
-            f"{self._llmc_label(self.predict_llmc[0])} (scoring)": score_remaining,
+            f"{self._llmc_label(self.decision_llmc)} (scoring)": full_samples
+            * self._jev_requests_per_sample(n_policies),
         }
 
     def _estimate_predict_requests(self, samples: pd.DataFrame) -> Dict[str, int]:
-        """Estimate remaining LLM calls for predict(), accounting for any checkpoint.
-
-        Approximate: answers missing from a batched response are re-queried
-        individually, which can add up to policy_batch_size - 1 extra calls
-        per batch.
-        """
+        """Estimate remaining Jev calls for predict(), accounting for any checkpoint."""
         ckpt = self._read_predict_ckpt(self._predict_fingerprint(samples)) or {}
         done_ids = set(ckpt.get("completed", {}).keys())
-        remaining_samples = sum(1 for idx in samples.index if str(idx) not in done_ids)
-        if hasattr(self, "_feature_order_") and self._lr is not None:
-            # Zero-weight policies (common with L1) are skipped by
-            # _predict_single, so only count the ones actually queried.
-            n_policies = int(np.count_nonzero(self._lr.coef_[0]))
-        elif hasattr(self, "_feature_order_"):
-            n_policies = len(self._feature_order_)
-        else:
-            n_policies = self.max_policy_length
-        label = self._llmc_label(self.predict_llmc[0])
-        per_sample = (
-            self._jev_requests_per_sample(n_policies)
-            if self._scores_with_jev
-            else math.ceil(n_policies / self.policy_batch_size)
-        )
-        return {f"{label} (predict)": remaining_samples * per_sample}
+        remaining = sum(1 for idx in samples.index if str(idx) not in done_ids)
+        n_used = int(np.count_nonzero(self.lr.coef_[0]))
+        return {
+            f"{self._llmc_label(self.decision_llmc)} (predict)": remaining
+            * self._jev_requests_per_sample(n_used)
+        }
 
     # ── Checkpointing ───────────────────────────────────────────────────────────
+
+    # One checkpoint file spans the whole fit() pipeline (the batches' policies,
+    # the merged list and the scored cells), so resuming never mixes progress
+    # from runs that describe different policies or data.
+    _FIT_CKPT_NAME = "fit_checkpoint.json"
+    _PREDICT_CKPT_NAME = "predict_checkpoint.json"
 
     def _ckpt_path(self, name: str) -> Path:
         return self.save_path / name
@@ -613,16 +510,66 @@ class PolicyInduction(TRLModel):
         path = self._ckpt_path(name)
         return orjson.loads(path.read_bytes()) if path.exists() else None
 
+    def _del_ckpt(self, *names: str) -> None:
+        for name in names:
+            p = self._ckpt_path(name)
+            if p.exists():
+                p.unlink()
+        # Remove directories the checkpoint's mkdir(parents=True) created that
+        # are now empty; rmdir raises OSError on the first non-empty ancestor,
+        # so this never deletes a directory with content.
+        d = self.save_path
+        while d != d.parent:
+            try:
+                d.rmdir()
+            except OSError:
+                break
+            d = d.parent
+
+    def _fit_fingerprint(self) -> str:
+        """Identifies a fit() run: the task, the generation setup and the data.
+
+        A checkpoint written for anything else (other data, other batches, a
+        different task) must not be resumed.
+        """
+        digest = hashlib.sha256()
+        digest.update(
+            repr(
+                (
+                    self._task_description,
+                    self._pgen_instructions_template,
+                    self.gen_batches,
+                    self.max_raw_policies,
+                    self.random_state,
+                    self.decision_llmc.model,
+                )
+            ).encode()
+        )
+        if self._X is not None and self._y is not None:
+            digest.update(repr(self._X.to_dict("split")).encode())
+            digest.update("".join(self._y.tolist()).encode())
+        return digest.hexdigest()
+
+    def _load_fit_ckpt(self) -> dict:
+        """The fit checkpoint, if this run wrote it; otherwise empty."""
+        ckpt = self._read_ckpt(self._FIT_CKPT_NAME)
+        if ckpt is None:
+            return {}
+        if ckpt.get("run") != self._fit_fingerprint():
+            logger.info("Ignoring a fit checkpoint written for another run.")
+            return {}
+        return ckpt
+
     def _predict_fingerprint(self, samples: pd.DataFrame) -> str:
         """Identifies a predict() run: the model, and the samples' index and values.
 
         Checkpoint entries are keyed by index, so resuming one for other rows
-        that share it (e.g. another frame indexed 0..n-1), or after a refit or
-        a threshold change, would replay answers that no longer apply.
+        that share it, or after a refit or a threshold change, would replay
+        answers that no longer apply.
         """
         lr = self._lr
         model = (
-            list(getattr(self, "_feature_order_", [])),
+            self._policies,
             lr.coef_.tolist() if lr is not None else None,
             np.asarray(lr.intercept_).tolist() if lr is not None else None,
             self._threshold,
@@ -643,583 +590,278 @@ class PolicyInduction(TRLModel):
             return None
         return ckpt
 
-    def _del_ckpt(self, *names: str) -> None:
-        for name in names:
-            p = self._ckpt_path(name)
-            if p.exists():
-                p.unlink()
-        # Clean up directories the checkpoint's mkdir(parents=True) created and
-        # that are now empty — including the intermediate parents (e.g. the
-        # default save_path is cwd/policy_induction/<name>, so both levels get
-        # created). Walk up removing empty dirs; rmdir raises OSError on the
-        # first non-empty ancestor (one holding save() artifacts or anything
-        # else), so this stops there and never deletes a dir with content.
-        d = self.save_path
-        while d != d.parent:
-            try:
-                d.rmdir()
-            except OSError:
-                break
-            d = d.parent
-
-    # Single checkpoint file spanning the whole fit() pipeline (generation +
-    # scoring), so resuming never mixes progress from two independently
-    # cleared checkpoints that could describe different generated policies.
-    _FIT_CKPT_NAME = "fit_checkpoint.json"
-
-    # Flush a checkpoint after this many (policy, sample) cells complete,
-    # anywhere in the scoring pass, so interrupting a large run still saves
-    # whatever finished instead of losing it.
-    _SCORING_CKPT_EVERY = 25
-
-    # Single checkpoint file for predict(), same automatic/unconditional
-    # design as _FIT_CKPT_NAME: always on, always at self.save_path, deleted
-    # once every sample is predicted.
-    _PREDICT_CKPT_NAME = "predict_checkpoint.json"
-    _PREDICT_CKPT_EVERY = 25
-
     # ── Policy generation ───────────────────────────────────────────────────────
 
-    async def _run_generation(self, instructions: str) -> List[str]:
-        """Run policy induction. Resumes from checkpoint if present."""
-        ckpt = self._read_ckpt(self._FIT_CKPT_NAME) or {}
-        all_policies: List[str] = ckpt.get("policies", [])
-        batches_done: int = ckpt.get("batches_done", 0)
-
-        # Skip already-done batches via islice (still advances _sample()'s
-        # internal RNG state correctly) instead of iterating through them
-        # inside the progress bar, so a resumed run starts the bar at
-        # batches_done instead of flashing through 0..batches_done. The stop
-        # bound applies max_gen_batches on top of the class-exhaustion stop
-        # _sample() already does on its own; None means no extra cap.
-        remaining_batches = itertools.islice(
-            self._sample(self.max_samples_as_context, seed=self.random_state),
-            batches_done,
-            self.max_gen_batches,
+    async def _generate_batch(self, rows: NDArray[np.intp]) -> List[str]:
+        """Policies from one labelled batch, written without seeing any other."""
+        X, y = cast(pd.DataFrame, self._X), cast(NDArray[np.str_], self._y)
+        samples = "\n\n".join(
+            f"[{y[i]}]\n{self._render_sample(X.iloc[i])}" for i in rows
         )
-        for batch_idx, sample_df in enumerate(
-            tqdm(
-                remaining_batches,
-                initial=batches_done,
-                desc="[GEN]",
-                unit="",
-                bar_format=_BAR_FORMAT,
-                ascii=_BAR_ASCII,
-            ),
-            start=batches_done,
-        ):
-            samples_str = "\n".join(
-                "\n".join(f"{col}: {val}" for col, val in row.items()) + ";"
-                for row in sample_df.to_dict(orient="records")
+        query = (
+            f"TASK DESCRIPTION:\n{self._task_description}\n\n"
+            f"LABELLED SAMPLES:\n{samples}\n\n"
+        )
+        response = await self._llm_instance.respond(
+            query=query,
+            llm_priority=self.gen_llmc,
+            response_format=Policies,
+            instructions=self._pgen_instructions_template,
+            temperature=_GEN_TEMPERATURE,
+        )
+        await self._token_counter.append(
+            provider=response.provider_model.provider,
+            model=response.provider_model.model,
+            value=response.total_tokens,
+            caller="PolicyInduction.generate",
+        )
+        if response.response is None:
+            raise LLMError("No response from LLM for a generation batch.")
+        return [p.strip() for p in response.response.policies if p.strip()]
+
+    async def _merge_policies(self, raw: List[str]) -> List[str]:
+        """Combine the batches' policies into at most ``max_raw_policies``."""
+        unique = list(dict.fromkeys(raw))
+        if not unique:
+            raise LLMError("The generation batches produced no policies.")
+        cap = self.max_raw_policies
+        instructions = POLICY_MERGE_INSTRUCTIONS.format(max_policies=cap)
+        query = (
+            f"TASK DESCRIPTION:\n{self._task_description}\n\n"
+            "POLICIES:\n" + "\n".join(f"- {p}" for p in unique)
+        )
+        merged: List[str] = []
+        for _ in range(2):
+            response = await self._llm_instance.respond(
+                query=query,
+                llm_priority=self.gen_llmc,
+                response_format=Policies,
+                instructions=instructions,
+                temperature=_MERGE_TEMPERATURE,
             )
-            query = (
-                f"TASK DESCRIPTION:\n{self._task_description}\n\n"
-                f"EXISTING POLICIES:\n{chr(10).join(all_policies)}\n\n"
-                f"SAMPLES:\n{samples_str}\n\n"
-            )
-            async with self._llm_semaphore:
-                response = await self._llm_instance.respond(
-                    query=query,
-                    llm_priority=self.gen_llmc,
-                    response_format=Policies,
-                    instructions=instructions,
-                    temperature=self.gen_temperature,
-                )
             await self._token_counter.append(
                 provider=response.provider_model.provider,
                 model=response.provider_model.model,
                 value=response.total_tokens,
-                caller="PolicyInduction.generate",
+                caller="PolicyInduction.merge",
             )
             if response.response is None:
-                raise LLMError(f"Batch {batch_idx}: no response from LLM.")
-            all_policies = response.response.policies[: self.max_policy_length]
-            logger.info(f"Batch {batch_idx + 1}: {len(all_policies)} policies")
-            self._write_ckpt(
-                self._FIT_CKPT_NAME,
-                {"policies": all_policies, "batches_done": batch_idx + 1, "scores": {}},
+                raise LLMError("No response from LLM for the merge step.")
+            merged = list(
+                dict.fromkeys(
+                    p.strip() for p in response.response.policies if p.strip()
+                )
             )
-
-        return all_policies
+            if 0 < len(merged) <= cap:
+                return merged
+            query += (
+                f"\n\nYour previous answer had {len(merged)} policies. "
+                f"Return at most {cap}."
+            )
+        logger.warning(
+            "Merge returned %d policies, over the cap of %d; keeping the first %d.",
+            len(merged),
+            cap,
+            cap,
+        )
+        return (merged or unique)[:cap]
 
     async def _generate_policies(self) -> None:
-        if len(self._policy_memory) > 0:
-            logger.info(
-                f"Skipping generation: {len(self._policy_memory)} policies in memory."
-            )
+        """Generate batches independently, merge them, and checkpoint each step."""
+        if self._policies:
+            logger.info(f"Skipping generation: {len(self._policies)} policies held.")
             return
+        if not self._pgen_instructions_template:
+            raise ValueError("Call set_task() before fit().")
 
-        instructions = self._get_gen_instructions()
-        policies = await self._run_generation(instructions)
+        ckpt = self._load_fit_ckpt()
+        ckpt["run"] = self._fit_fingerprint()
+        batches: Dict[str, List[str]] = ckpt.setdefault("batches", {})
 
-        self._policy_memory = pd.DataFrame(
-            {
-                "policy": policies,
-                "predictions": [None] * len(policies),
-            }
-        )
-        logger.info(f"Generation complete: {len(policies)} policies.")
+        def flush() -> None:
+            self._write_ckpt(self._FIT_CKPT_NAME, ckpt)
+
+        if not ckpt.get("merged"):
+            rows_by_batch = self._batch_indices()
+            todo = [i for i in range(len(rows_by_batch)) if str(i) not in batches]
+
+            async def run(i: int) -> None:
+                batches[str(i)] = await self._generate_batch(rows_by_batch[i])
+                logger.info(f"Batch {i + 1}: {len(batches[str(i)])} policies")
+                flush()
+
+            if todo:
+                try:
+                    async with asyncio.TaskGroup() as tg:
+                        for i in todo:
+                            tg.create_task(run(i))
+                except ExceptionGroup as eg:
+                    raise eg.exceptions[0] from None
+            raw = [p for i in sorted(batches, key=int) for p in batches[i]]
+            ckpt["merged"] = await self._merge_policies(raw)
+            ckpt.setdefault("scores", {})
+            flush()
+
+        self._policies = list(ckpt["merged"])
+        logger.info(f"Generation complete: {len(self._policies)} policies.")
 
     # ── Policy scoring ──────────────────────────────────────────────────────────
 
-    def _fix_memory(self) -> None:
-        """Drop rows with missing policies or malformed prediction series.
+    @staticmethod
+    def _jev_question(policy: str) -> NoulQuestion:
+        return NoulQuestion(instructions=POLICY_JEV_QUESTION.format(policy=policy))
 
-        A prediction Series with some null entries is kept as-is — it
-        represents a policy that's partially scored, not a broken one. Only
-        the wrong length (stale/mismatched data) resets it to unscored.
+    def _jev_state(self, sample: str) -> str:
+        return POLICY_JEV_STATE.format(
+            task_description=self._task_description, sample=sample
+        )
+
+    async def _score_policies(self, budget: JevBudget) -> None:
+        """Score every unscored (sample, policy) cell; checkpoint as it goes.
+
+        Each sample is one Jev request carrying all of its unscored policies.
         """
-        pm = self._policy_memory.dropna(subset=["policy"]).copy()
-        expected = len(self._X) if self._X is not None else 0
-        for idx in pm.index:
-            val = pm.at[idx, "predictions"]
-            if isinstance(val, pd.Series):
-                if len(val) != expected:
-                    pm.at[idx, "predictions"] = None
-            elif val is not None:
-                pm.at[idx, "predictions"] = None
-        self._policy_memory = pm
+        X = cast(pd.DataFrame, self._X)
+        n, k = len(X), len(self._policies)
+        scores = np.full((n, k), np.nan)
 
-    def _load_scoring_ckpt(self) -> None:
-        """Restore scored policy predictions from disk into _policy_memory.
-
-        Reads the "scores" section of the same checkpoint file that
-        generation writes to, so restored scores can never describe a
-        different set of policies than the ones currently in memory.
-        """
-        ckpt = self._read_ckpt(self._FIT_CKPT_NAME)
-        if ckpt is None or self._X is None:
-            return
-        scores: dict = ckpt.get("scores", {})
-        restored = 0
-        for str_pid, pred_dict in scores.items():
-            pid = int(str_pid)
-            if pid not in self._policy_memory.index:
-                continue
-            s = pd.Series(pred_dict, dtype="object")
-            s.index = s.index.astype(type(self._X.index[0]))
-            self._policy_memory.at[pid, "predictions"] = s.reindex(self._X.index)
-            restored += 1
+        ckpt = self._load_fit_ckpt()
+        saved: Dict[str, Dict[str, float]] = (
+            ckpt.get("scores", {}) if ckpt.get("merged") == self._policies else {}
+        )
+        for pid, cells in saved.items():
+            for sample, value in cells.items():
+                scores[int(sample), int(pid)] = value
+        restored = int(np.count_nonzero(~np.isnan(scores)))
         if restored:
-            logger.info(f"Restored scoring checkpoint: {restored} policies pre-scored.")
+            logger.info(f"Restored scoring checkpoint: {restored} cells pre-scored.")
+        self._scores = scores
 
-    def _save_scoring_ckpt(self) -> None:
-        """Atomically persist current policy predictions to disk, complete or not.
-
-        Partial (in-progress) Series are saved too, not just fully-scored
-        ones, so interrupting mid-policy still keeps whatever finished.
-        Preserves the "policies"/"batches_done" section already written by
-        generation, only replacing "scores" — both sections live in the
-        same file for the whole fit() run.
-        """
-        scores: dict[str, dict] = {}
-        for idx, row in self._policy_memory.iterrows():
-            val = row["predictions"]
-            if isinstance(val, pd.Series):
-                scores[str(idx)] = {
-                    str(k): (None if pd.isna(v) else v) for k, v in val.items()
+        def flush() -> None:
+            ckpt["run"] = self._fit_fingerprint()
+            ckpt["merged"] = list(self._policies)
+            ckpt["scores"] = {
+                str(p): {
+                    str(s): float(scores[s, p])
+                    for s in range(n)
+                    if not np.isnan(scores[s, p])
                 }
-        ckpt = self._read_ckpt(self._FIT_CKPT_NAME) or {}
-        ckpt["scores"] = scores
-        self._write_ckpt(self._FIT_CKPT_NAME, ckpt)
+                for p in range(k)
+            }
+            self._write_ckpt(self._FIT_CKPT_NAME, ckpt)
 
-    async def _score_policy_single(
-        self,
-        sample_str: str,
-        policy_text: str,
-        token_counter: TokenCounter,
-        caller: str,
-    ) -> Literal["YES", "NO"] | None:
-        """Ask one policy about one sample. Returns None if it can't be answered.
-
-        This is the original, unbatched call. It is used directly when
-        policy_batch_size == 1, and as the re-query path for answers missing
-        from a batched response.
-        """
-        try:
-            query = (
-                f"Task description:\n{self._task_description}\n\n"
-                f"Policy:\n{policy_text}\n\n"
-                f"Sample:\n{sample_str}\n\n"
-            )
-            async with self._llm_semaphore:
-                response = await self._llm_instance.respond(
-                    query=query,
-                    llm_priority=self.predict_llmc,
-                    instructions=POLICY_PREDICT_INSTRUCTIONS,
-                    response_format=Answer,
-                    temperature=self.predict_temperature,
-                )
-            await token_counter.append(
-                provider=response.provider_model.provider,
-                model=response.provider_model.model,
-                value=response.total_tokens,
-                caller=caller,
-            )
-            if response.response is None:
-                raise LLMError("No response from LLM")
-            txt = str(response.response.answer).strip().upper().strip('".,;:')
-            return (
-                cast(Literal["YES", "NO"], txt)
-                if txt in {"YES", "NO"}
-                else "YES"
-                if "YES" in txt
-                else "NO"
-                if "NO" in txt
-                else None
-            )
-        except Exception:
-            logger.warning("Scoring worker error", exc_info=True)
-            return None
-
-    async def _score_policy_batch(
-        self,
-        sample_str: str,
-        policies: Sequence[Tuple[str, str]],
-        token_counter: TokenCounter,
-        caller: str,
-    ) -> Dict[str, Literal["YES", "NO"]]:
-        """Judge one sample against several policies in a single LLM call.
-
-        Shared by fit-time scoring and predict(), so both paths always draw
-        features the same way.
-
-        Args:
-            sample_str: The rendered sample.
-            policies: (key, policy_text) pairs. Keys are opaque here and are
-                what the returned mapping is keyed by; the prompt uses its own
-                0..n-1 ids, so the model never sees them.
-            token_counter: Counter to charge this call to.
-            caller: Label recorded on the token counter.
-
-        Returns:
-            key -> "YES"/"NO" for every policy successfully judged. Keys absent
-            from the mapping could not be resolved even after an individual
-            re-query; the caller decides what that means.
-        """
-        if not policies:
-            return {}
-        if len(policies) == 1:
-            key, text = policies[0]
-            ans = await self._score_policy_single(
-                sample_str, text, token_counter, caller
-            )
-            return {key: ans} if ans is not None else {}
-
-        local_ids = {i: key for i, (key, _) in enumerate(policies)}
-        policies_block = "\n".join(
-            f"id={i}: {text}" for i, (_, text) in enumerate(policies)
-        )
-        query = (
-            f"Task description:\n{self._task_description}\n\n"
-            f"Policies:\n{policies_block}\n\n"
-            f"Sample:\n{sample_str}\n\n"
-        )
-
-        out: Dict[str, Literal["YES", "NO"]] = {}
-        try:
-            async with self._llm_semaphore:
-                response = await self._llm_instance.respond(
-                    query=query,
-                    llm_priority=self.predict_llmc,
-                    instructions=POLICY_PREDICT_BATCH_INSTRUCTIONS,
-                    response_format=BatchedAnswers,
-                    temperature=self.predict_temperature,
-                )
-            await token_counter.append(
-                provider=response.provider_model.provider,
-                model=response.provider_model.model,
-                value=response.total_tokens,
-                caller=caller,
-            )
-            if response.response is None:
-                raise LLMError("No response from LLM")
-            # Pydantic already constrains `answer` to the literal, so only the
-            # id needs checking. Unknown/duplicate ids are dropped and fall
-            # through to the individual re-query below.
-            for item in response.response.answers:
-                key = local_ids.get(item.policy_id)
-                if key is not None and key not in out:
-                    out[key] = item.answer
-        except Exception:
-            # Deliberately no re-query here: if the call itself failed, the
-            # provider is unhealthy and fanning out to N individual calls
-            # would be worse than not batching at all. Unanswered cells stay
-            # missing: an interrupted fit retries them when resumed, and a
-            # finished one counts them as NO (_warn_unscored says how many).
-            logger.warning("Batched scoring worker error", exc_info=True)
-            return out
-
-        missing = [(key, text) for key, text in policies if key not in out]
-        if missing:
-            logger.warning(
-                "Batched scoring returned %d/%d answers; re-querying %d individually.",
-                len(out),
-                len(policies),
-                len(missing),
-            )
-            results = await asyncio.gather(
-                *(
-                    self._score_policy_single(sample_str, text, token_counter, caller)
-                    for _, text in missing
-                )
-            )
-            for (key, _), ans in zip(missing, results):
-                if ans is not None:
-                    out[key] = ans
-        return out
-
-    def _render_sample(self, row: pd.Series) -> str:
-        return "\n".join(f"{col}: {row[col]}" for col in row.index)
-
-    async def _score_policies(self) -> None:
-        """Score every unscored (policy, sample) cell; checkpoint as it goes.
-
-        Iterates sample-major so each LLM call carries one sample and up to
-        `policy_batch_size` policies.
-        """
-        if self._X is None or self._y is None:
-            raise ValueError("X and y must be set before scoring.")
-
-        self._fix_memory()
-        self._load_scoring_ckpt()
-        self._fix_memory()
-
-        # Materialise a full-length Series for every policy up front so workers
-        # only ever write into an existing cell. Side effect: the checkpoint now
-        # also holds all-None rows for untouched policies, where they used to be
-        # omitted — both _load_scoring_ckpt and _estimate_fit_requests treat a
-        # None cell as unscored, so this is equivalent.
-        for pid in self._policy_memory.index:
-            val = self._policy_memory.at[pid, "predictions"]
-            self._policy_memory.at[pid, "predictions"] = (  # type: ignore
-                val.reindex(self._X.index)
-                if isinstance(val, pd.Series)
-                else pd.Series(
-                    [None] * len(self._X), index=self._X.index, dtype="object"
-                )
-            )
-        series_by_pid = {
-            pid: self._policy_memory.at[pid, "predictions"]
-            for pid in self._policy_memory.index
-        }
-
-        # Cells still needing work, grouped by sample.
-        pending: Dict[Any, List[Any]] = {}
-        for pid, s in series_by_pid.items():
-            for sidx in s.index[s.isna()]:
-                pending.setdefault(sidx, []).append(pid)
-
-        # Flatten to units of (sample, policy chunk).
-        bs = self.policy_batch_size
-        units: List[Tuple[Any, List[Any]]] = [
-            (sidx, pids[i : i + bs])
-            for sidx, pids in pending.items()
-            for i in range(0, len(pids), bs)
-        ]
-
-        if self._scores_with_jev:
-            open_pids = {pid for pids in pending.values() for pid in pids}
-            await self._score_policies_jev(
-                [pid for pid in self._policy_memory.index if pid in open_pids]
-            )
-            logger.info("Scoring complete.")
-            self._warn_unscored()
-            return
-
-        total_cells = len(self._policy_memory) * len(self._X)
-        pending_cells = sum(len(p) for p in pending.values())
-        logger.info(
-            f"Scoring {pending_cells} (policy, sample) cells in {len(units)} LLM calls."
-        )
-
-        done_q: asyncio.Queue[int] = asyncio.Queue()
-
-        async def worker(sidx: Any, pids: List[Any]) -> None:
-            try:
-                sample_str = self._render_sample(self._X.loc[sidx])  # type: ignore
-                answers = await self._score_policy_batch(
-                    sample_str=sample_str,
-                    policies=[
-                        (str(pid), str(self._policy_memory.at[pid, "policy"]))
-                        for pid in pids
-                    ],
-                    token_counter=self._token_counter,
-                    caller="PolicyInduction.score_policy",
-                )
-                for pid in pids:
-                    series_by_pid[pid].at[sidx] = answers.get(str(pid))
-            except Exception:
-                logger.warning("Scoring worker error", exc_info=True)
-            finally:
-                done_q.put_nowait(len(pids))
-
-        it = iter(units)
-        in_flight = 0
-        since_checkpoint = 0
-        calls_done = 0
+        pending = [s for s in range(n) if np.isnan(scores[s]).any()]
+        logger.info(f"Scoring {len(pending)} samples against {k} policies.")
         pbar = tqdm(
-            total=total_cells,
-            initial=total_cells - pending_cells,
+            total=n,
+            initial=n - len(pending),
             desc="[SCORE]",
             unit="",
             bar_format=_BAR_FORMAT,
             ascii=_BAR_ASCII,
         )
         try:
-            async with asyncio.TaskGroup() as tg:
-                for _ in range(self.llm_semaphore_limit):
-                    try:
-                        sidx, pids = next(it)
-                    except StopIteration:
-                        break
-                    tg.create_task(worker(sidx, pids))
-                    in_flight += 1
-                while in_flight > 0:
-                    n = await done_q.get()
-                    in_flight -= 1
-                    calls_done += 1
-                    since_checkpoint += n
-                    pbar.update(n)
-                    if since_checkpoint >= self._SCORING_CKPT_EVERY:
-                        self._save_scoring_ckpt()
-                        since_checkpoint = 0
-                    if calls_done % self.p_predict_update_interval == 0:
-                        logger.info(f"Scored {calls_done}/{len(units)} batches.")
-                    try:
-                        sidx, pids = next(it)
-                    except StopIteration:
-                        continue
-                    tg.create_task(worker(sidx, pids))
-                    in_flight += 1
+            for start in range(0, len(pending), _SCORE_CHUNK):
+                chunk = pending[start : start + _SCORE_CHUNK]
+                requests = [
+                    JevRequest(
+                        state=self._jev_state(self._render_sample(X.iloc[s])),
+                        questions={
+                            f"p{p}": self._jev_question(self._policies[p])
+                            for p in range(k)
+                            if np.isnan(scores[s, p])
+                        },
+                    )
+                    for s in chunk
+                ]
+                try:
+                    results = await self._llm_instance.answer_many(
+                        [self.decision_llmc],
+                        requests,
+                        budget=budget,
+                        token_counter=self._token_counter,
+                        caller="PolicyInduction.score_policy",
+                    )
+                except (JevAuthError, JevCostCapError):
+                    raise
+                except LLMError as e:
+                    logger.warning(
+                        "Scoring failed for %d samples; they stay unscored: %s",
+                        len(chunk),
+                        e,
+                    )
+                    continue
+                for s, result in zip(chunk, results):
+                    for qid, value in result.answers.items():
+                        if isinstance(value, float):
+                            scores[s, int(qid[1:])] = value
+                flush()
+                pbar.update(len(chunk))
         finally:
             pbar.close()
-            if since_checkpoint > 0:
-                self._save_scoring_ckpt()
+            flush()
 
-        logger.info("Scoring complete.")
-        self._warn_unscored()
-
-    def _warn_unscored(self) -> None:
-        """Say how many cells got no answer; the weight fit counts them as NO."""
-        preds = [
-            s for s in self._policy_memory["predictions"] if isinstance(s, pd.Series)
-        ]
-        missing = sum(int(s.isna().sum()) for s in preds)
+        missing = int(np.isnan(scores).sum())
+        if missing == scores.size:
+            raise LLMError("No (sample, policy) cell could be scored.")
         if missing:
-            total = sum(len(s) for s in preds)
             logger.warning(
-                f"{missing} of {total} (policy, sample) cells could not be scored "
-                "and count as NO."
+                f"{missing} of {scores.size} (sample, policy) cells could not be "
+                "scored and count as 0."
             )
-
-    async def _score_policies_jev(self, policy_ids: List[Any]) -> None:
-        """Score policies with Jev: one request per sample, all its open policies."""
-        X = cast(pd.DataFrame, self._X)
-        series: Dict[Any, pd.Series] = {}
-        for pid in policy_ids:
-            existing = self._policy_memory.at[pid, "predictions"]
-            series[pid] = (
-                existing.copy()
-                if isinstance(existing, pd.Series)
-                else pd.Series([None] * len(X), index=X.index, dtype="object")
-            )
-        qid_to_pid = {f"p{pid}": pid for pid in policy_ids}
-
-        requests: List[JevRequest] = []
-        sample_ids: List[Any] = []
-        for idx, row in X.iterrows():
-            questions: Dict[str, JevQuestion] = {
-                qid: self._jev_question(str(self._policy_memory.at[pid, "policy"]))
-                for qid, pid in qid_to_pid.items()
-                if pd.isna(series[pid].at[idx])
-            }
-            if questions:
-                sample_str = "\n".join(f"{col}: {row[col]}" for col in row.index)
-                requests.append(JevRequest(state=sample_str, questions=questions))
-                sample_ids.append(idx)
-
-        results = await llm.answer_many(
-            self.predict_llmc,
-            requests,
-            token_counter=self._token_counter,
-            caller="PolicyInduction.score_policy",
-        )
-        for idx, result in zip(sample_ids, results):
-            for qid, value in result.answers.items():
-                if isinstance(value, float):
-                    series[qid_to_pid[qid]].at[idx] = yes_no(value)
-        for pid, scored in series.items():
-            self._policy_memory.at[pid, "predictions"] = scored  # type: ignore
-        self._save_scoring_ckpt()
+        logger.info("Scoring complete.")
 
     # ── Weight fitting ──────────────────────────────────────────────────────────
 
-    def _check_memory(self, require_predictions: bool = False) -> None:
-        pm = self._policy_memory
-        if not isinstance(pm, pd.DataFrame) or not {"policy", "predictions"}.issubset(
-            pm.columns
-        ):
-            raise ValueError("_policy_memory is invalid or missing required columns.")
-        is_str = pm["policy"].apply(lambda x: isinstance(x, str))
-        if require_predictions:
-            is_pred = pm["predictions"].apply(lambda x: isinstance(x, pd.Series))
-            pm = pm[is_str & is_pred]
-        else:
-            pm = pm[is_str]
-        if len(pm) == 0:
-            raise ValueError("No valid policies in memory.")
-        self._policy_memory = pm  # type: ignore
+    def _feature_matrix(self) -> Tuple[NDArray[np.float64], NDArray[np.int_]]:
+        if self._scores is None or self._y is None:
+            raise ValueError("Policies must be scored before weights are fitted.")
+        X = np.nan_to_num(self._scores, nan=0.0)
+        y = (self._y == "YES").astype(int)
+        return X, y
 
-    def _build_feature_matrix(
-        self,
-    ) -> Tuple[np.ndarray, np.ndarray, pd.Index, np.ndarray]:
-        self._check_memory()
-        pm = self._policy_memory
-        sample_index = self._X.index  # type: ignore
-        col_data: dict[str, pd.Series] = {}
-        col_names: list[str] = []
-
-        def to_binary(v: Any) -> int:
-            return 1 if str(v).strip().lower() in {"1", "true", "yes", "y", "t"} else 0
-
-        for idx, row in pm.iterrows():
-            col = str(idx)
-            col_data[col] = (
-                row["predictions"]
-                .map(to_binary)  # type: ignore
-                .reindex(sample_index)
-                .fillna(0)
-                .astype(np.float32)
-            )
-            col_names.append(col)
-
-        X_df = pd.DataFrame(col_data, index=sample_index)
-        y_num = pd.Series(self._y, index=sample_index).map(to_binary).astype(int)
-        return (
-            X_df.values,
-            y_num.to_numpy(),
-            sample_index,
-            np.array(col_names, dtype=str),
+    def _new_lr(self, C: float, max_iter: int) -> LogisticRegression:
+        cfg = self.config
+        return LogisticRegression(
+            C=C,
+            **_penalty_kwargs(cfg.penalty),
+            solver="liblinear",
+            max_iter=max_iter,
+            class_weight="balanced" if cfg.class_weight_balanced else None,
+            random_state=cfg.random_state,
         )
 
     def _fit_weights(self) -> None:
+        """Pick the regularisation strength by CV and fit the final model.
+
+        With ``one_se_rule`` the strongest ``C`` within one standard error of
+        the best CV F-beta wins, so the model keeps as few policies as it can.
+        A ``C`` that leaves every policy at zero weight is never chosen.
+
+        Raises:
+            ValueError: ``config.Cs`` is empty, or no candidate keeps a policy.
+            DataError: A class has too few rows for cross-validation.
+        """
         cfg = self.config
-        X, y, _, col_names = self._build_feature_matrix()
+        X, y = self._feature_matrix()
         n_samples, n_policies = X.shape
         logger.info(f"Fitting weights: {n_samples} samples × {n_policies} policies.")
 
-        self._feature_order_ = col_names
-        self._policy_pos_ = {name: i for i, name in enumerate(col_names)}
-        self._n_features_ = n_policies
-
+        Cs = sorted(float(c) for c in cfg.Cs)
+        if not Cs:
+            raise ValueError("config.Cs must contain at least one candidate C value.")
+        folds = min(cfg.cv_folds, int(np.bincount(y).min()))
+        if folds < 2:
+            raise DataError("Each class needs at least 2 rows for cross-validation.")
         skf = StratifiedKFold(
-            n_splits=cfg.cv_folds, shuffle=True, random_state=cfg.random_state
+            n_splits=folds, shuffle=True, random_state=cfg.random_state
         )
-        best_C, best_score, best_thresholds = None, -np.inf, []
 
+        means: Dict[float, float] = {}
+        errors: Dict[float, float] = {}
+        thresholds: Dict[float, List[float]] = {}
         for C in tqdm(
-            list(cfg.Cs),
+            Cs,
             desc="[FIT]",
             unit="",
             bar_format=_BAR_FORMAT,
@@ -1227,14 +869,7 @@ class PolicyInduction(TRLModel):
         ):
             fold_scores, fold_thresholds = [], []
             for tr_idx, val_idx in skf.split(X, y):
-                lr = LogisticRegression(
-                    C=C,
-                    **_penalty_kwargs(cfg.penalty),
-                    solver="liblinear",
-                    max_iter=500,
-                    class_weight="balanced" if cfg.class_weight_balanced else None,
-                    random_state=cfg.random_state,
-                )
+                lr = self._new_lr(C, max_iter=500)
                 lr.fit(X[tr_idx], y[tr_idx])
                 probs = lr.predict_proba(X[val_idx])[:, 1]
                 best_f, best_t = -1.0, 0.5
@@ -1249,38 +884,48 @@ class PolicyInduction(TRLModel):
                         best_f, best_t = f, t
                 fold_scores.append(best_f)
                 fold_thresholds.append(best_t)
+            means[C] = float(np.mean(fold_scores))
+            errors[C] = float(np.std(fold_scores, ddof=1) / math.sqrt(folds))
+            thresholds[C] = fold_thresholds
+            logger.info(f"C={C} → mean F{cfg.beta}={means[C]:.5f}")
 
-            mean_f = float(np.mean(fold_scores))
-            logger.info(f"C={C} → mean F{cfg.beta}={mean_f:.5f}")
-            if mean_f > best_score:
-                best_C, best_score, best_thresholds = C, mean_f, fold_thresholds
-
-        if best_C is None:
-            raise ValueError("config.Cs must contain at least one candidate C value.")
-
-        final_lr = LogisticRegression(
-            C=best_C,
-            **_penalty_kwargs(cfg.penalty),
-            solver="liblinear",
-            max_iter=1000,
-            class_weight="balanced" if cfg.class_weight_balanced else None,
-            random_state=cfg.random_state,
+        best_C = max(Cs, key=lambda c: means[c])
+        eligible = (
+            [c for c in Cs if means[c] >= means[best_C] - errors[best_C]]
+            if cfg.one_se_rule
+            else [best_C]
         )
-        final_lr.fit(X, y)
-        self._lr = final_lr
-        self.threshold = float(np.median(best_thresholds)) if best_thresholds else 0.5
 
+        final_lr: LogisticRegression | None = None
+        chosen_C = best_C
+        for C in eligible:  # ascending, so strongest regularisation first
+            lr = self._new_lr(C, max_iter=1000)
+            lr.fit(X, y)
+            if np.count_nonzero(lr.coef_[0]):
+                final_lr, chosen_C = lr, C
+                break
+        if final_lr is None:
+            raise ValueError(
+                "Every policy has zero weight at the chosen regularisation. "
+                "Add stronger-signal policies, or raise config.Cs."
+            )
+
+        self._lr = final_lr
+        best_thresholds = thresholds[chosen_C]
+        self.threshold = float(np.median(best_thresholds))
+        used = int(np.count_nonzero(final_lr.coef_[0]))
         self._validation_result = {
-            "best_C": best_C,
-            "avg_cv_fbeta": best_score,
+            "best_C": chosen_C,
+            "avg_cv_fbeta": means[chosen_C],
             "beta": cfg.beta,
             "thresholds_per_fold": best_thresholds,
             "recommended_threshold": self._threshold,
+            "policies_used": used,
             "config": asdict(cfg),
         }
         logger.info(
-            f"Fit complete. C={best_C}, F{cfg.beta}={best_score:.4f}, "
-            f"threshold={self._threshold:.3f}."
+            f"Fit complete. C={chosen_C}, F{cfg.beta}={means[chosen_C]:.4f}, "
+            f"threshold={self._threshold:.3f}, {used}/{n_policies} policies used."
         )
 
     # ── Prediction ──────────────────────────────────────────────────────────────
@@ -1292,141 +937,42 @@ class PolicyInduction(TRLModel):
         prob = self._lr.predict_proba(vec)[0, 1]
         return "YES" if prob >= self._threshold else "NO"
 
-    async def _predict_single(
+    async def _predict_chunk(
         self,
-        sample_index: Any,
-        sample: str,
+        samples: pd.DataFrame,
+        used: List[int],
+        budget: JevBudget,
         token_counter: TokenCounter,
-    ) -> Tuple[Any, NDArray, Literal["YES", "NO"]]:
-        if not hasattr(self, "_feature_order_") or self._lr is None:
-            raise RuntimeError("Model not fitted. Call fit() first.")
-
-        policies = self._policy_memory["policy"].copy()
-        policies.index = policies.index.map(str)
-        policies = policies.reindex(self._feature_order_)
-
-        # Zero-weight policies (common with L1) can't affect lr.predict_proba
-        # regardless of their answer, so skip querying the LLM for them —
-        # `results` stays 0.0 at those positions, which is correct either way.
-        weights = self._lr.coef_[0]
-        tasks_to_run = [
-            (pos, pt)
-            for pos, pt in enumerate(policies.fillna("").astype(str).values)
-            if pt.strip() and weights[pos] != 0
-        ]
-
-        results = np.zeros(len(self._feature_order_), dtype=float)
-        missing_positions: List[int] = []
-        done_q: asyncio.Queue[None] = asyncio.Queue()
-
-        # Same batching as fit-time scoring, via the same primitive, so the
-        # features fed to the LR here match the ones it was trained on.
-        bs = self.policy_batch_size
-        units: List[List[Tuple[int, str]]] = [
-            tasks_to_run[i : i + bs] for i in range(0, len(tasks_to_run), bs)
-        ]
-
-        async def worker(chunk: List[Tuple[int, str]]) -> None:
-            try:
-                answers = await self._score_policy_batch(
-                    sample_str=sample,
-                    policies=[(str(pos), pt) for pos, pt in chunk],
-                    token_counter=token_counter,
-                    caller="PolicyInduction.predict_single",
-                )
-                for pos, _pt in chunk:
-                    ans = answers.get(str(pos))
-                    if ans is None:
-                        missing_positions.append(pos)
-                    else:
-                        results[pos] = 1.0 if ans == "YES" else 0.0
-            except Exception:
-                logger.warning("Predict worker error", exc_info=True)
-                missing_positions.extend(pos for pos, _ in chunk)
-            finally:
-                done_q.put_nowait(None)
-
-        it = iter(units)
-        in_flight = 0
-        async with asyncio.TaskGroup() as tg:
-            for _ in range(self.llm_semaphore_limit):
-                try:
-                    chunk = next(it)
-                except StopIteration:
-                    break
-                tg.create_task(worker(chunk))
-                in_flight += 1
-            while in_flight > 0:
-                await done_q.get()
-                in_flight -= 1
-                try:
-                    chunk = next(it)
-                except StopIteration:
-                    continue
-                tg.create_task(worker(chunk))
-                in_flight += 1
-
-        if missing_positions:
-            if len(missing_positions) == len(tasks_to_run):
-                # Every policy failed, so `results` would be all zeros — a
-                # vector the LR would happily classify despite resting on no
-                # evidence at all. Refuse to produce a record; predict() skips
-                # the sample and leaves it out of the checkpoint so a later
-                # run retries it.
-                raise LLMError(
-                    f"Sample {sample_index}: no policy answers obtained "
-                    f"({len(tasks_to_run)} policies queried)."
-                )
-            logger.warning(
-                "Sample %s: %d/%d policy answers missing after re-query; "
-                "treating as NO.",
-                sample_index,
-                len(missing_positions),
-                len(tasks_to_run),
-            )
-
-        return sample_index, results, self._lr_predict(results)
-
-    async def _predict_many_jev(
-        self, samples: pd.DataFrame, token_counter: TokenCounter
     ) -> List[Tuple[Any, NDArray, Literal["YES", "NO"]]]:
-        """Predict samples with Jev: one request per sample, weighted policies."""
-        if not hasattr(self, "_feature_order_") or self._lr is None:
-            raise RuntimeError("Model not fitted. Call fit() first.")
-        policies = self._policy_memory["policy"].copy()
-        policies.index = policies.index.map(str)
-        policies = policies.reindex(self._feature_order_)
-        weights = self._lr.coef_[0]
+        """Predict a few samples with one Jev request each, on weighted policies."""
         questions: Dict[str, JevQuestion] = {
-            f"p{pos}": self._jev_question(pt)
-            for pos, pt in enumerate(policies.fillna("").astype(str).values)
-            if pt.strip() and weights[pos] != 0
+            f"p{p}": self._jev_question(self._policies[p]) for p in used
         }
         rows = list(samples.iterrows())
-        results = await llm.answer_many(
-            self.predict_llmc,
+        results = await self._llm_instance.answer_many(
+            [self.decision_llmc],
             [
                 JevRequest(
-                    state="\n".join(f"{col}: {val}" for col, val in row.items()),
+                    state=self._jev_state(self._render_sample(row)),
                     questions=questions,
                 )
                 for _, row in rows
             ],
+            budget=budget,
             token_counter=token_counter,
             caller="PolicyInduction.predict_single",
         )
         records: List[Tuple[Any, NDArray, Literal["YES", "NO"]]] = []
         for (idx, _), result in zip(rows, results):
-            vec = np.zeros(len(self._feature_order_), dtype=float)
+            vec = np.zeros(len(self._policies), dtype=float)
             answered = 0
             for qid, value in result.answers.items():
                 if isinstance(value, float):
                     answered += 1
-                    if value >= YES_THRESHOLD:
-                        vec[int(qid[1:])] = 1.0
-            # Same rules as the chat path (_predict_single): no answers at all
-            # is no evidence, so no prediction; a partial miss counts as NO.
-            if questions and not answered:
+                    vec[int(qid[1:])] = value
+            # No answers at all is no evidence, so no prediction; a partial
+            # miss counts as 0 for the missing policies.
+            if not answered:
                 logger.warning(
                     "Predict failed for sample %s: no policy answers from Jev; "
                     "skipping.",
@@ -1435,7 +981,7 @@ class PolicyInduction(TRLModel):
                 continue
             if answered < len(questions):
                 logger.warning(
-                    "Sample %s: %d/%d policy answers missing; treating as NO.",
+                    "Sample %s: %d/%d policy answers missing; counting them as 0.",
                     idx,
                     len(questions) - answered,
                     len(questions),
@@ -1446,8 +992,18 @@ class PolicyInduction(TRLModel):
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def get_memory(self) -> pd.DataFrame:
-        """Return the policy memory DataFrame (policy text + predictions)."""
-        return self._policy_memory
+        """Return each policy with its scores (Jev's P(YES)) on the training set."""
+        index = pd.RangeIndex(len(self._policies))
+        preds = [
+            pd.Series(self._scores[:, p], index=self._X.index)  # type: ignore[union-attr]
+            if self._scores is not None and self._X is not None
+            else None
+            for p in index
+        ]
+        return pd.DataFrame(
+            {"policy": self._policies, "predictions": pd.Series(preds, dtype=object)},
+            index=index,
+        )
 
     async def fit(
         self,
@@ -1456,10 +1012,9 @@ class PolicyInduction(TRLModel):
     ) -> Self:
         """Fit the PolicyInduction model.
 
-        Runs policy generation, scoring, and weight fitting in sequence. A
-        single checkpoint file spans generation and scoring, so resuming
-        after an interruption never restores scores for a different set of
-        policies than the ones actually in memory.
+        Runs generation, merge, scoring and weight fitting in sequence. One
+        checkpoint file spans all of them, so resuming after an interruption
+        never restores progress for different policies or data.
 
         Args:
             X: Feature DataFrame.
@@ -1467,17 +1022,24 @@ class PolicyInduction(TRLModel):
 
         Returns:
             Self.
+
+        Raises:
+            DataError: The data has too few YES or NO rows for ``gen_batches``.
         """
         # A model loaded without the key must not spend on generation first.
         require_typesafe_key(
-            self.predict_llmc, method="PolicyInduction", param="predict_llmc"
+            [self.decision_llmc], method="PolicyInduction", param="decision_llmc"
         )
+        if not self._pgen_instructions_template:
+            raise ValueError("Call set_task() before fit().")
         self._set_data(X, y)
+        if not self._policies:
+            self._batch_indices()  # raises before any LLM spend
         self._confirm_requests(self._estimate_fit_requests())
         start = time.monotonic()
 
         await self._generate_policies()
-        await self._score_policies()
+        await self._score_policies(JevBudget(self.decision_llmc.max_cost_usd))
         self._fit_weights()
         self._fit_duration_seconds = time.monotonic() - start
         self._fit_completed_at = datetime.now(timezone.utc).isoformat()
@@ -1490,11 +1052,11 @@ class PolicyInduction(TRLModel):
     ) -> AsyncGenerator[Tuple[Any, NDArray, Literal["YES", "NO"], TokenCounter], None]:
         """Yield predictions for each sample in the DataFrame.
 
-        Automatically checkpoints to self.save_path as it goes, resuming an
-        in-progress checkpoint found there only if it was written by the same
-        fitted model for the same samples (same index and values) — same
-        unconditional, single-file design as fit(). The checkpoint is deleted
-        once every sample has been predicted.
+        Only policies with a non-zero weight are sent to Jev. Automatically
+        checkpoints to self.save_path as it goes, resuming a checkpoint found
+        there only if it was written by the same fitted model for the same
+        samples (same index and values). The checkpoint is deleted once every
+        sample has been predicted.
 
         May yield fewer records than len(samples): a sample for which no
         policy answer could be obtained at all is skipped rather than given a
@@ -1506,11 +1068,15 @@ class PolicyInduction(TRLModel):
             samples: DataFrame of samples to classify.
 
         Yields:
-            (sample_index, policy_vector, prediction, token_counter)
+            (sample_index, policy_vector, prediction, token_counter). The vector
+            holds Jev's P(YES) for each policy, 0 for policies the model does
+            not use.
         """
-        self._check_memory()
-        if not hasattr(self, "_feature_order_") or self._lr is None:
+        if not self._policies or self._lr is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
+        require_typesafe_key(
+            [self.decision_llmc], method="PolicyInduction", param="decision_llmc"
+        )
         self._confirm_requests(self._estimate_predict_requests(samples))
 
         token_counter = TokenCounter()
@@ -1553,62 +1119,9 @@ class PolicyInduction(TRLModel):
                 },
             )
 
-        if self._scores_with_jev:
-            records: List[Tuple[Any, NDArray, Literal["YES", "NO"]]] = []
-            if len(remaining_samples):
-                try:
-                    records = await self._predict_many_jev(
-                        cast(pd.DataFrame, remaining_samples), token_counter
-                    )
-                except (JevAuthError, JevCostCapError):
-                    raise
-                except LLMError as e:
-                    # Every request failed. As on the chat path, skip the
-                    # samples and keep the checkpoint for a later retry, rather
-                    # than raise on every retry of a sample Jev can't answer.
-                    logger.warning(
-                        "Predict failed for %d samples; skipping: %s",
-                        len(remaining_samples),
-                        e,
-                    )
-                for sidx, vec, pred in records:
-                    completed[str(sidx)] = (vec.tolist(), pred)
-                save_ckpt()
-                for record in records:
-                    yield record + (token_counter,)
-            if len(records) == len(remaining_samples):
-                self._del_ckpt(self._PREDICT_CKPT_NAME)
-            return
-
-        queue: asyncio.Queue = asyncio.Queue()
-        sem = asyncio.Semaphore(self.llm_semaphore_limit)
-
+        used = [int(p) for p in np.flatnonzero(self._lr.coef_[0])]
+        budget = JevBudget(self.decision_llmc.max_cost_usd)
         had_failures = False
-
-        async def worker(idx: Any, sample_str: str) -> None:
-            nonlocal had_failures
-            await sem.acquire()
-            try:
-                rec = await self._predict_single(idx, sample_str, token_counter)
-                await queue.put(rec)
-            except Exception:
-                had_failures = True
-                logger.warning(
-                    "Predict failed for sample %s; skipping.", idx, exc_info=True
-                )
-            finally:
-                await queue.put("DONE")
-                sem.release()
-
-        tasks = [
-            asyncio.create_task(
-                worker(idx, "\n".join(f"{col}: {val}" for col, val in row.items()))
-            )
-            for idx, row in remaining_samples.iterrows()
-        ]
-        remaining = len(tasks)
-        since_checkpoint = 0
-        success = False
         pbar = tqdm(
             total=len(samples),
             initial=len(completed),
@@ -1618,32 +1131,35 @@ class PolicyInduction(TRLModel):
             ascii=_BAR_ASCII,
         )
         try:
-            while remaining > 0:
-                item = await queue.get()
-                if item == "DONE":
-                    remaining -= 1
-                else:
-                    sidx, vec, pred = item
+            for start in range(0, len(remaining_samples), _PREDICT_CHUNK):
+                chunk = remaining_samples.iloc[start : start + _PREDICT_CHUNK]
+                try:
+                    records = await self._predict_chunk(
+                        chunk, used, budget, token_counter
+                    )
+                except (JevAuthError, JevCostCapError):
+                    save_ckpt()
+                    raise
+                except LLMError as e:
+                    # Every request failed: skip these samples and keep the
+                    # checkpoint so a later run retries them.
+                    had_failures = True
+                    logger.warning(
+                        "Predict failed for %d samples; skipping: %s", len(chunk), e
+                    )
+                    continue
+                if len(records) < len(chunk):
+                    had_failures = True
+                for sidx, vec, pred in records:
                     completed[str(sidx)] = (vec.tolist(), pred)
-                    since_checkpoint += 1
-                    pbar.update(1)
-                    if since_checkpoint >= self._PREDICT_CKPT_EVERY:
-                        save_ckpt()
-                        since_checkpoint = 0
-                    yield item + (token_counter,)
-            success = True
-        except asyncio.CancelledError:
-            pass
+                save_ckpt()
+                pbar.update(len(records))
+                for record in records:
+                    yield record + (token_counter,)
         finally:
             pbar.close()
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            if success and not had_failures:
-                self._del_ckpt(self._PREDICT_CKPT_NAME)
-            elif since_checkpoint > 0 or had_failures:
-                # Keep the checkpoint so skipped samples are retried next run.
-                save_ckpt()
+        if not had_failures:
+            self._del_ckpt(self._PREDICT_CKPT_NAME)
 
     # ── Persistence ─────────────────────────────────────────────────────────────
 
@@ -1678,19 +1194,15 @@ class PolicyInduction(TRLModel):
             lines.append(f"- Decision threshold: {v['recommended_threshold']:.4f}")
             lines.append("")
 
-        if self._lr is not None and hasattr(self, "_feature_order_"):
-            policies = self._policy_memory["policy"].copy()
-            policies.index = policies.index.map(str)
+        if self._lr is not None and self._policies:
 
             def clean(text: object) -> str:
                 return str(text).replace("|", "\\|").replace("\n", " ")
 
-            weights = dict(
-                zip(self._feature_order_.tolist(), self._lr.coef_[0].tolist())
-            )
-            ranked = sorted(weights.items(), key=lambda kv: abs(kv[1]), reverse=True)
-            used = [(pid, w) for pid, w in ranked if w != 0]
-            dropped = [(pid, w) for pid, w in ranked if w == 0]
+            weights = self._lr.coef_[0].tolist()
+            ranked = sorted(enumerate(weights), key=lambda kv: abs(kv[1]), reverse=True)
+            used = [(p, w) for p, w in ranked if w != 0]
+            dropped = [(p, w) for p, w in ranked if w == 0]
 
             lines.append(
                 f"## Policies used by the model ({len(used)}/{len(ranked)}, "
@@ -1699,15 +1211,15 @@ class PolicyInduction(TRLModel):
             lines.append("")
             lines.append("| Rank | Weight | Policy |")
             lines.append("|---|---|---|")
-            for rank, (pid, w) in enumerate(used, 1):
-                lines.append(f"| {rank} | {w:+.4f} | {clean(policies.get(pid, '?'))} |")
+            for rank, (p, w) in enumerate(used, 1):
+                lines.append(f"| {rank} | {w:+.4f} | {clean(self._policies[p])} |")
             lines.append("")
 
             if dropped:
                 lines.append(f"## Policies dropped (zero weight, {len(dropped)})")
                 lines.append("")
-                for pid, _ in dropped:
-                    lines.append(f"- {clean(policies.get(pid, '?'))}")
+                for p, _ in dropped:
+                    lines.append(f"- {clean(self._policies[p])}")
                 lines.append("")
         else:
             lines.append("## Policies")
@@ -1727,7 +1239,7 @@ class PolicyInduction(TRLModel):
 
             policy_induction.json        manifest, config, state
             policies.parquet             policy texts
-            policy_predictions.parquet   scored YES/NO matrix  (dev only)
+            policy_scores.parquet        Jev's P(YES) matrix    (dev only)
             data.parquet                 training data          (dev only)
             lr.joblib                    trained logistic regression
             report.md                    human-readable fit summary
@@ -1742,7 +1254,7 @@ class PolicyInduction(TRLModel):
         base.mkdir(parents=True, exist_ok=True)
         if for_production:
             # Training files an earlier save left here must not survive.
-            for name in ("data.parquet", "policy_predictions.parquet"):
+            for name in ("data.parquet", "policy_scores.parquet"):
                 (base / name).unlink(missing_ok=True)
 
         # Training data (dev mode only)
@@ -1757,29 +1269,21 @@ class PolicyInduction(TRLModel):
                 df.to_parquet(base / "data.parquet")
 
         # Policy texts
-        pm = self._policy_memory.copy()
-        policies_df = (
-            pm.drop(columns=["predictions"], errors="ignore")
-            .reset_index()
-            .rename(columns={"index": "policy_id"})
-        )
-        policies_df["policy_id"] = policies_df["policy_id"].astype(str)
-        policies_df.to_parquet(base / "policies.parquet")
+        pd.DataFrame(
+            {
+                "policy_id": [str(i) for i in range(len(self._policies))],
+                "policy": self._policies,
+            }
+        ).to_parquet(base / "policies.parquet")
 
-        # Policy predictions on training set (dev mode only)
-        if not for_production and "predictions" in pm.columns:
-            pred_rows = [
-                {
-                    "sample_index": sidx,
-                    "policy_id": str(pid),
-                    "pred": None if pd.isna(val) else str(val),
-                }
-                for pid, preds in pm["predictions"].items()
-                if isinstance(preds, pd.Series)
-                for sidx, val in preds.items()
-            ]
-            if pred_rows:
-                pd.DataFrame(pred_rows).to_parquet(base / "policy_predictions.parquet")
+        # Scores on the training set (dev mode only)
+        if not for_production and self._scores is not None and self._X is not None:
+            scores_df = pd.DataFrame(
+                self._scores,
+                index=self._X.index,
+                columns=pd.Index([str(i) for i in range(len(self._policies))]),
+            )
+            scores_df.to_parquet(base / "policy_scores.parquet")
 
         # LR model
         model_file = None
@@ -1787,31 +1291,15 @@ class PolicyInduction(TRLModel):
             model_file = "lr.joblib"
             joblib_dump(self._lr, base / model_file)
 
-        # Manifest
-        feature_order = (
-            self._feature_order_.tolist()
-            if hasattr(self, "_feature_order_") and self._feature_order_ is not None
-            else None
-        )
         manifest = {
-            "version": 3,
+            "version": _MANIFEST_VERSION,
             "name": self.name,
             "gen_llmc": [
                 lc if isinstance(lc, dict) else lc.model_dump() for lc in self.gen_llmc
             ],
-            "predict_llmc": [
-                lc if isinstance(lc, dict) else lc.model_dump()
-                for lc in self.predict_llmc
-            ],
-            "gen_temperature": self.gen_temperature,
-            "predict_temperature": self.predict_temperature,
-            "llm_semaphore_limit": self.llm_semaphore_limit,
-            "max_policy_length": self.max_policy_length,
-            "class_ratio": list(self.class_ratio),
-            "max_samples_as_context": self.max_samples_as_context,
-            "max_gen_batches": self.max_gen_batches,
-            "policy_batch_size": self.policy_batch_size,
-            "p_predict_update_interval": self.p_predict_update_interval,
+            "decision_llmc": self.decision_llmc.model_dump(),
+            "gen_batches": [list(self.gen_batches[0]), self.gen_batches[1]],
+            "max_raw_policies": self.max_raw_policies,
             "random_state": self.random_state,
             "task_description": self._task_description,
             "policy_gen_instructions_template": (
@@ -1821,8 +1309,7 @@ class PolicyInduction(TRLModel):
             "save_path": str(self.save_path) if not for_production else None,
             "threshold": self._threshold,
             "validation_result": self._validation_result,
-            "feature_order": feature_order,
-            "n_features": getattr(self, "_n_features_", None),
+            "n_policies": len(self._policies),
             "model_file": model_file,
             "config": asdict(self.config),
         }
@@ -1847,33 +1334,20 @@ class PolicyInduction(TRLModel):
             raise FileNotFoundError(f"policy_induction.json not found in {base}")
 
         m = orjson.loads(manifest_path.read_bytes())
+        if m.get("version", 0) < _MANIFEST_VERSION or "decision_llmc" not in m:
+            raise ValueError(
+                "This PolicyInduction was saved by an older version, which scored "
+                "policies with chat models. Its policies and weights do not apply "
+                "to Jev's probabilities; refit the model."
+            )
 
+        (pos, neg), n = m["gen_batches"]
         inst = cls(
             gen_llmc=m["gen_llmc"],
-            predict_llmc=m["predict_llmc"],
+            decision_llmc=m["decision_llmc"],
+            gen_batches=((pos, neg), n),
+            max_raw_policies=m["max_raw_policies"],
             config=m.get("config"),
-            gen_temperature=m["gen_temperature"],
-            predict_temperature=m["predict_temperature"],
-            llm_semaphore_limit=m["llm_semaphore_limit"],
-            max_policy_length=m["max_policy_length"],
-            class_ratio=tuple(m["class_ratio"]),
-            max_samples_as_context=m["max_samples_as_context"],
-            # Plain .get(), deliberately not falling back to the constructor
-            # default: None is a meaningful value here (uncapped), so it has
-            # to survive a round trip. Old saves lacking the key also load
-            # uncapped, which is how they were actually trained.
-            max_gen_batches=m.get("max_gen_batches"),
-            # A save predating this key (manifest v2) drew its features
-            # unbatched at fit time, so it must keep drawing them unbatched:
-            # batching at predict would skew features against the trained
-            # weights — same train-consistency rule as max_gen_batches above.
-            # For a present-but-None value (v3 writes the key unconditionally,
-            # so only a hand-edited manifest hits this) fall back to the
-            # constructor default via `or`, never to None.
-            policy_batch_size=(
-                int(m["policy_batch_size"] or 10) if "policy_batch_size" in m else 1
-            ),
-            p_predict_update_interval=m["p_predict_update_interval"],
             random_state=m["random_state"],
             save_path=str(base),
             name=m["name"],
@@ -1884,12 +1358,6 @@ class PolicyInduction(TRLModel):
             inst._token_counter = TokenCounter.from_dict(tk)
         inst._threshold = m.get("threshold", 0.0)
         inst._validation_result = m.get("validation_result")
-        inst._llm_semaphore = asyncio.Semaphore(inst.llm_semaphore_limit)
-
-        if (fo := m.get("feature_order")) is not None:
-            inst._feature_order_ = np.array(fo, dtype=str)
-            inst._n_features_ = int(m.get("n_features") or len(inst._feature_order_))
-            inst._policy_pos_ = {name: i for i, name in enumerate(inst._feature_order_)}
 
         # Training data
         data_path = base / "data.parquet"
@@ -1908,31 +1376,16 @@ class PolicyInduction(TRLModel):
             raise ValueError(
                 "policies.parquet must contain 'policy_id' and 'policy' columns."
             )
-        p_df = p_df.set_index(p_df["policy_id"].astype(str))
-        inst._policy_memory = pd.DataFrame(
-            {
-                "policy": p_df["policy"],
-                "predictions": pd.Series(
-                    [None] * len(p_df), index=p_df.index, dtype=object
-                ),
-            }
+        inst._policies = (
+            p_df.assign(_k=p_df["policy_id"].astype(int))
+            .sort_values("_k")["policy"]
+            .tolist()
         )
 
-        # Predictions on training set
-        preds_path = base / "policy_predictions.parquet"
-        if preds_path.exists() and inst._X is not None:
-            pp = pd.read_parquet(preds_path)
-            if not {"sample_index", "policy_id", "pred"}.issubset(pp.columns):
-                raise ValueError("policy_predictions.parquet missing required columns.")
-            pp["policy_id"] = pp["policy_id"].astype(str)
-            for pid, g in pp.groupby("policy_id"):
-                s = pd.Series(
-                    g["pred"].values, index=g["sample_index"].values, dtype="object"
-                )
-                if pid in inst._policy_memory.index:
-                    inst._policy_memory.at[pid, "predictions"] = s.reindex(  # type: ignore
-                        inst._X.index
-                    )
+        # Scores on the training set
+        scores_path = base / "policy_scores.parquet"
+        if scores_path.exists() and inst._X is not None:
+            inst._scores = pd.read_parquet(scores_path).to_numpy(dtype=float)
 
         # LR model
         if mf := m.get("model_file"):
@@ -1948,9 +1401,16 @@ class PolicyInduction(TRLModel):
 
         Args:
             dir_path: Directory produced by save().
+
+        Raises:
+            ValueError: The model was saved by a version that scored policies
+                with chat models, or the manifest is corrupted.
         """
         try:
             with loading_saved_model():
                 return cls._load(dir_path)
         except KeyError as e:
             raise ValueError(f"Manifest corrupted or missing key: {e}") from e
+
+
+__all__ = ["PolicyInduction", "Policies", "WeightTrainerConfig"]

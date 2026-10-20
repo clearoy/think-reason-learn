@@ -13,35 +13,29 @@ import pytest
 from think_reason_learn.core.llms import LLMChoice, OpenAIChoice
 from think_reason_learn.policy_induction import PolicyInduction
 
+pytestmark = pytest.mark.usefixtures("typesafe_key")
+
 CHAT: list[LLMChoice] = [OpenAIChoice(model="gpt-4.1-nano")]
 
 
-def _fitted(tmp_path: Path, penalty: str) -> PolicyInduction:
+def _fitted(tmp_path: Path, penalty: str, **config: Any) -> PolicyInduction:
     """Fit weights on one informative policy and five noise policies."""
     rng = np.random.default_rng(0)
     n = 120
     y = np.where(np.arange(n) % 2 == 0, "YES", "NO")
-    informative = np.where(rng.random(n) < 0.9, y, np.where(y == "YES", "NO", "YES"))
-    columns: list[Any] = [informative] + [
-        np.where(rng.random(n) < 0.5, "YES", "NO") for _ in range(5)
-    ]
+    informative = np.where(rng.random(n) < 0.9, y == "YES", y != "YES") * 0.8 + 0.1
+    columns: list[Any] = [informative] + [rng.random(n) for _ in range(5)]
 
     pi = PolicyInduction(
         gen_llmc=CHAT,
-        predict_llmc=CHAT,
-        config={"penalty": penalty, "Cs": (0.1,), "cv_folds": 3},
+        config={"penalty": penalty, "Cs": (0.1,), "cv_folds": 3, **config},
         save_path=tmp_path,
         name="weights",
         confirm_requests=False,
     )
     pi._set_data(pd.DataFrame({"text": [f"sample {i}" for i in range(n)]}), list(y))
-    index = pi._X.index  # type: ignore[union-attr]
-    pi._policy_memory = pd.DataFrame(
-        {
-            "policy": [f"policy {j}" for j in range(len(columns))],
-            "predictions": [pd.Series(col, index=index) for col in columns],
-        }
-    )
+    pi._policies = [f"policy {j}" for j in range(len(columns))]
+    pi._scores = np.column_stack(columns)
     pi._fit_weights()
     return pi
 
@@ -84,3 +78,41 @@ def test_weight_fit_raises_no_sklearn_deprecation(tmp_path: Path) -> None:
         warnings.filterwarnings("error", category=UserWarning, module="sklearn")
         _fitted(tmp_path, "l1")
         _fitted(tmp_path, "l2")
+
+
+def test_one_se_rule_picks_a_stronger_c_than_the_best_scoring_one(
+    tmp_path: Path,
+) -> None:
+    grid = {"Cs": (0.01, 0.03, 0.1, 0.3, 1.0, 10.0)}
+    best = _fitted(tmp_path / "best", "l1", one_se_rule=False, **grid)
+    one_se = _fitted(tmp_path / "se", "l1", one_se_rule=True, **grid)
+
+    assert one_se.validation_result["best_C"] <= best.validation_result["best_C"]
+    assert np.count_nonzero(one_se.lr.coef_[0]) <= np.count_nonzero(best.lr.coef_[0])
+
+
+def test_a_c_that_zeroes_every_policy_is_never_chosen(tmp_path: Path) -> None:
+    pi = _fitted(tmp_path, "l1", Cs=(1e-6, 0.3, 1.0))
+
+    assert pi.validation_result["best_C"] > 1e-6
+    assert np.count_nonzero(pi.lr.coef_[0]) > 0
+
+
+def test_a_fit_where_every_policy_has_zero_weight_raises(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="zero weight"):
+        _fitted(tmp_path, "l1", Cs=(1e-6,))
+
+
+def test_empty_cs_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least one candidate"):
+        _fitted(tmp_path, "l1", Cs=())
+
+
+def test_a_class_with_one_row_cannot_be_cross_validated(tmp_path: Path) -> None:
+    pi = _fitted(tmp_path / "ok", "l1")
+    pi._y = np.array(["YES"] + ["NO"] * (len(pi._y) - 1))  # type: ignore[arg-type]
+
+    from think_reason_learn.core.exceptions import DataError
+
+    with pytest.raises(DataError, match="at least 2 rows"):
+        pi._fit_weights()

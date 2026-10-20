@@ -43,7 +43,8 @@ Two kinds of model do the work:
   ``OPENAI_API_KEY``, ``GOOGLE_AI_API_KEY``, ``ANTHROPIC_API_KEY`` or ``XAI_API_KEY``.
 - Jev answers those questions about each sample, by default. Jev is Typesafe's System One model, and its key is
   ``TYPESAFE_API_KEY``; see `docs.typesafe.ai <https://docs.typesafe.ai>`_ for access and prices. Without the key,
-  creating an RRF, GPTree or PolicyInduction raises an error that shows how to answer with a chat model instead.
+  creating an RRF or GPTree raises an error that shows how to answer with a chat model instead. Policy Induction
+  always scores with Jev, so it always needs the key.
 
 Set the keys in your environment or in a ``.env`` file in the folder you run from, and keep that file out of version
 control:
