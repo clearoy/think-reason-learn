@@ -104,7 +104,9 @@ class LLM(metaclass=SingletonMeta):
         self.google_llm = get_google_llm(settings.GOOGLE_AI_API_KEY)
         self.openai_llm = get_openai_llm(settings.OPENAI_API_KEY)
         self.xai_llm = get_xai_llm(settings.XAI_API_KEY)
-        self.jev_llm = get_jev_client(settings.TYPESAFE_API_KEY)
+        self.jev_llm = get_jev_client(
+            settings.TYPESAFE_API_KEY, settings.OPENROUTER_API_KEY
+        )
 
     def _val_llm_priority_and_api_keys(
         self, llm_priority: List[LLMChoice]
@@ -141,7 +143,7 @@ class LLM(metaclass=SingletonMeta):
 
             if getattr(self, f"{llmp.provider}_llm") is None:
                 key_name = (
-                    "TYPESAFE_API_KEY"
+                    "TYPESAFE_API_KEY (or OPENROUTER_API_KEY)"
                     if llmp.provider == "jev"
                     else f"{llmp.provider.upper()}_API_KEY"
                 )

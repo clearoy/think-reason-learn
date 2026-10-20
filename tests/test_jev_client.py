@@ -615,3 +615,88 @@ async def test_warns_once_when_a_run_mixes_jev_releases(
 
     [warning] = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert "jev-1.13.0" in warning and "jev-1.14.0" in warning
+
+
+# ── OpenRouter ─────────────────────────────────────────────────────────────────
+
+
+def test_settings_read_the_openrouter_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    assert Settings(_env_file=None).OPENROUTER_API_KEY == "or-key"  # type: ignore[call-arg]
+
+
+def test_a_typesafe_key_alone_reaches_typesafe() -> None:
+    from think_reason_learn.core.llms._jev.client import ENDPOINT, get_jev_client
+
+    client = get_jev_client("ts-key", "")
+
+    assert client is not None
+    assert client.endpoint == ENDPOINT and client.api_key == "ts-key"
+
+
+def test_an_openrouter_key_alone_reaches_openrouter() -> None:
+    from think_reason_learn.core.llms._jev.client import get_jev_client
+
+    client = get_jev_client("", "or-key")
+
+    assert client is not None
+    assert client.endpoint == "https://openrouter.ai/api/v1/systemone"
+    assert client.api_key == "or-key"
+
+
+def test_openrouter_wins_over_a_stale_typesafe_key() -> None:
+    from think_reason_learn.core.llms._jev.client import get_jev_client
+
+    client = get_jev_client("deactivated-ts-key", "or-key")
+
+    assert client is not None and client.api_key == "or-key"
+    assert "openrouter.ai" in client.endpoint
+
+
+def test_no_key_means_no_client() -> None:
+    from think_reason_learn.core.llms._jev.client import get_jev_client
+
+    assert get_jev_client("", "") is None
+
+
+@pytest.mark.asyncio
+async def test_requests_go_to_openrouter_with_its_key(tmp_path: Path) -> None:
+    from think_reason_learn.core.llms._jev.client import get_jev_client
+
+    server = FakeJevServer()
+    seen: List[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return server.handler(request)
+
+    client = get_jev_client("", "or-key")
+    assert client is not None
+    client._transport = httpx.MockTransport(handler)
+    client.cache_dir = tmp_path / "cache"
+
+    results = await client.answer_many(
+        [_noul_request()], model="jev-latest", budget=JevBudget(10.0)
+    )
+
+    assert str(seen[0].url) == "https://openrouter.ai/api/v1/systemone"
+    assert seen[0].headers["Authorization"] == "Bearer or-key"
+    assert server.bodies[0]["model"] == "jev-latest"  # OpenRouter maps it itself
+    assert list(results[0].answers.values())[0] == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_openrouter_key_names_openrouter(tmp_path: Path) -> None:
+    server = FakeJevServer([lambda b: httpx.Response(401, text="bad key")])
+    client = JevClient(
+        api_key="or-key",
+        transport=server.transport(),
+        cache_dir=tmp_path / "cache",
+        service="OpenRouter",
+        key_name="OPENROUTER_API_KEY",
+    )
+
+    with pytest.raises(JevAuthError, match="OpenRouter rejected OPENROUTER_API_KEY"):
+        await client.answer_many(
+            [_noul_request()], model="jev-latest", budget=JevBudget(10.0)
+        )

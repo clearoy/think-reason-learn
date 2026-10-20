@@ -37,6 +37,8 @@ from .schemas import first_jev_choice, is_jev
 logger = logging.getLogger(__name__)
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/systemone"
+"""OpenRouter serves Jev with the same System One request and response shapes."""
 USD_PER_INPUT_TOKEN = 42 / 1e9
 """Typesafe list price for Jev input tokens (checked 22 September 2026).
 
@@ -252,7 +254,8 @@ class JevClient:
     """Concurrent, retrying, cost-capped client for Jev.
 
     Args:
-        api_key: The ``TYPESAFE_API_KEY``.
+        api_key: The ``TYPESAFE_API_KEY`` (or the ``OPENROUTER_API_KEY`` when
+            ``endpoint`` is OpenRouter's).
         endpoint: The System One endpoint.
         concurrency: Requests in flight at once.
         timeout: Seconds before a request times out (then it is retried).
@@ -269,6 +272,8 @@ class JevClient:
         api_key: str,
         *,
         endpoint: str = ENDPOINT,
+        service: str = "Typesafe",
+        key_name: str = "TYPESAFE_API_KEY",
         concurrency: int = 20,
         timeout: float = 120.0,
         max_attempts: int = 6,
@@ -278,6 +283,8 @@ class JevClient:
     ) -> None:
         self.api_key = api_key
         self.endpoint = endpoint
+        self.service = service
+        self.key_name = key_name
         self.concurrency = concurrency
         self.timeout = timeout
         self.max_attempts = max_attempts
@@ -378,7 +385,7 @@ class JevClient:
                         unreadable += 1
                 elif status in _AUTH_STATUSES:
                     raise JevAuthError(
-                        f"Typesafe rejected TYPESAFE_API_KEY (HTTP {status}: "
+                        f"{self.service} rejected {self.key_name} (HTTP {status}: "
                         f"{response.text[:200]}). Check the key in your "
                         "environment or .env file."
                     )
@@ -532,8 +539,19 @@ class JevClient:
         return results
 
 
-def get_jev_client(api_key: str) -> JevClient | None:
-    """Return a Jev client, or None when no TYPESAFE_API_KEY is set."""
+def get_jev_client(api_key: str, openrouter_api_key: str = "") -> JevClient | None:
+    """Return a Jev client, or None when no key is set.
+
+    An ``OPENROUTER_API_KEY`` wins over a ``TYPESAFE_API_KEY``, so a stale
+    Typesafe key left in the environment does not shadow it.
+    """
+    if openrouter_api_key:
+        return JevClient(
+            openrouter_api_key,
+            endpoint=OPENROUTER_ENDPOINT,
+            service="OpenRouter",
+            key_name="OPENROUTER_API_KEY",
+        )
     return JevClient(api_key) if api_key else None
 
 
@@ -563,7 +581,10 @@ def loading_saved_model() -> Iterator[None]:
 def require_typesafe_key(
     llm_priority: Sequence[object], *, method: str, param: str
 ) -> None:
-    """Raise if Jev is among the answerers and TYPESAFE_API_KEY is not set.
+    """Raise if Jev is among the answerers and neither of its keys is set.
+
+    Jev needs ``TYPESAFE_API_KEY``, or ``OPENROUTER_API_KEY`` to reach it through
+    OpenRouter.
 
     Args:
         llm_priority: The method's answering models.
@@ -582,11 +603,16 @@ def require_typesafe_key(
             f"{method}: put JevChoice first in {param}, or leave it out. Chat "
             "models can follow Jev as fallbacks, but cannot come before it."
         )
-    if settings.TYPESAFE_API_KEY or not _CHECK_KEYS.get():
+    if (
+        settings.TYPESAFE_API_KEY
+        or settings.OPENROUTER_API_KEY
+        or not _CHECK_KEYS.get()
+    ):
         return
     raise MissingAPIKeyError(
         f"{method} answers questions with Jev (Typesafe's System One model), "
-        "which needs TYPESAFE_API_KEY, and TYPESAFE_API_KEY is not set. Set it "
-        "in your environment or in a .env file, or answer with a chat model "
+        "which needs TYPESAFE_API_KEY (or OPENROUTER_API_KEY, to reach Jev "
+        "through OpenRouter), and neither is set. Set one in your environment "
+        "or in a .env file, or answer with a chat model "
         f'instead: {method}(..., {param}=[OpenAIChoice(model="gpt-4.1-mini")]).'
     )

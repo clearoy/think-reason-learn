@@ -60,7 +60,8 @@ poetry run pre-commit install  # Optional: code quality hooks
 
 A chat model (OpenAI, Google, Anthropic or xAI) writes the questions and policies; set its key, e.g. `OPENAI_API_KEY`.
 Jev, Typesafe's System One model, answers them about each sample by default, so also set `TYPESAFE_API_KEY`
-(see [docs.typesafe.ai](https://docs.typesafe.ai)). Keys can go in the environment or in a git-ignored `.env` file.
+(see [docs.typesafe.ai](https://docs.typesafe.ai)), or `OPENROUTER_API_KEY` to reach Jev through OpenRouter
+(it wins if both are set). Keys can go in the environment or in a git-ignored `.env` file.
 Each `fit()` or `predict()` prints its estimated Jev cost first and stops at a $10 cap unless you set another
 (`JevChoice(max_cost_usd=...)`). To answer with a chat model instead, pass it as the answering model, e.g.
 `RRF(qgen_llmc=llm, qanswer_llmc=llm)` or `GPTree(..., qanswer_llmc=llm)`. Policy Induction always scores with Jev.

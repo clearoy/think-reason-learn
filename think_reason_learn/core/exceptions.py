@@ -14,7 +14,7 @@ class CorruptionError(Exception):
 
 
 class JevAuthError(LLMError):
-    """Typesafe rejected the TYPESAFE_API_KEY (HTTP 401 or 403)."""
+    """Typesafe or OpenRouter rejected the Jev API key (HTTP 401 or 403)."""
 
 
 class JevCostCapError(LLMError):

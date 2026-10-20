@@ -190,3 +190,36 @@ def test_a_saved_policy_induction_loads_without_the_key(
     loaded = PolicyInduction.load(tmp_path / "saved")
 
     assert loaded.decision_llmc == JevChoice()
+
+
+@pytest.mark.parametrize("name,make,param", METHODS)
+def test_an_openrouter_key_is_enough_to_answer_with_jev(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_typesafe_key: None,
+    name: str,
+    make: Callable[..., Any],
+    param: str,
+) -> None:
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "or-key")
+
+    method = make(tmp_path)
+
+    assert getattr(method, param) == [JevChoice()]
+
+
+def test_policy_induction_accepts_an_openrouter_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_typesafe_key: None
+) -> None:
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "or-key")
+
+    assert _pi(tmp_path).decision_llmc == JevChoice()
+
+
+def test_the_missing_key_message_names_both_keys(
+    tmp_path: Path, no_typesafe_key: None
+) -> None:
+    with pytest.raises(MissingAPIKeyError) as info:
+        _pi(tmp_path)
+
+    assert "OPENROUTER_API_KEY" in str(info.value)

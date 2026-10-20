@@ -30,6 +30,9 @@ def offline_jev(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from think_reason_learn.core.llms import llm
     from think_reason_learn.core.llms._jev.client import JevClient
 
+    # A developer's OpenRouter key in .env must not hide a "key not set" test.
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "")
+
     def refuse(request: httpx.Request) -> httpx.Response:
         return httpx.Response(599, text="tests must not call Typesafe")
 

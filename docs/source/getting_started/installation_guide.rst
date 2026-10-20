@@ -42,7 +42,8 @@ Two kinds of model do the work:
 - A chat model writes the questions, policies and instructions. Set the key for the provider you choose:
   ``OPENAI_API_KEY``, ``GOOGLE_AI_API_KEY``, ``ANTHROPIC_API_KEY`` or ``XAI_API_KEY``.
 - Jev answers those questions about each sample, by default. Jev is Typesafe's System One model, and its key is
-  ``TYPESAFE_API_KEY``; see `docs.typesafe.ai <https://docs.typesafe.ai>`_ for access and prices. Without the key,
+  ``TYPESAFE_API_KEY``; see `docs.typesafe.ai <https://docs.typesafe.ai>`_ for access and prices. To reach Jev through
+  OpenRouter instead, set ``OPENROUTER_API_KEY``; it is used in preference to ``TYPESAFE_API_KEY`` when both are set. Without the key,
   creating an RRF or GPTree raises an error that shows how to answer with a chat model instead. Policy Induction
   always scores with Jev, so it always needs the key.
 

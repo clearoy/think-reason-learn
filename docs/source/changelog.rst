@@ -8,6 +8,9 @@ Unreleased
 ``predict_temperature`` and ``llm_semaphore_limit`` are gone, and ``set_task`` no longer takes an
 ``instructions_template``. Models saved by earlier versions do not load (refit them).
 
+- Jev can be reached through OpenRouter: set ``OPENROUTER_API_KEY`` and every Jev call goes to OpenRouter's System One
+  endpoint with that key, in preference to ``TYPESAFE_API_KEY``. The requests, answers and ``JevChoice(model="jev-latest")``
+  are unchanged.
 - ``decision_llmc`` is the only scorer and must be Jev (``JevChoice()`` by default, which needs
   ``TYPESAFE_API_KEY``). Policies can no longer be scored with a chat model.
 - Generation is ``gen_batches=((a, b), n)``: ``n`` batches, each showing ``a`` YES and ``b`` NO samples, written
